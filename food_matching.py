@@ -119,12 +119,21 @@ class RealWorldSupplySimulation:
         new_rows = []
         for shop in self.shops:
             for item in self.items:
-                # 戦略による発注精度の違い
-                # ★注意: 発注基準(target_stock)は固定値だが、需要予測が変わると在庫の減り方が変わるため
-                # 発注点方式では自動的に発注量が調整されていく
+                # --- 追加計算: 現在の価格設定に基づく需要倍率を取得 ---
+                current_price = self.item_props[item]['price']
+                base_price = self.item_props[item]['base_price']
+                elasticity = self.item_props[item]['elasticity']
+                if base_price <= 0: base_price = 1
+                price_ratio = current_price / base_price
+                price_factor = price_ratio ** (-elasticity)
+                # ---------------------------------------------------
+
+                # 発注基準にも価格による需要変動(price_factor)を掛ける
                 base_target = self.item_props[item]['target_stock']
                 scale = self.shop_scales[shop]
-                target_level = base_target * scale
+                
+                # ★ ここを変更: price_factor を掛ける
+                target_level = base_target * scale * price_factor
                 
                 if self.strategy == 'Random':
                     order_qty = int(self.rng.uniform(target_level * 0.5, target_level * 1.5))
