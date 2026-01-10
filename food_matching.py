@@ -31,8 +31,8 @@ st.set_page_config(layout="wide", page_title="食品サプライチェーン経�
 class RealWorldSupplySimulation:
     def __init__(self, 
                  strategy, 
-                 shop_config_df,     
-                 item_config_df,     
+                 shop_config_df,      
+                 item_config_df,      
                  random_seed=42, 
                  demand_std_scale=1.0, 
                  transport_threshold=5,
@@ -461,6 +461,9 @@ def main():
         demand_std = st.slider("需要のばらつき倍率", 0.0, 2.0, 1.0)
         threshold = st.slider("転送閾値 (New Model用)", 1, 10, 5)
         cost_unit = st.number_input("1個あたりの輸送コスト (円)", value=30)
+        
+        # --- シード値コントロールを追加 ---
+        seed_val = st.number_input("乱数シード", value=42, step=1, help="同じ値にすると結果が再現されます")
 
     if st.sidebar.button("4戦略比較を実行", type="primary"):
         if edited_shops_df.empty or edited_items_df.empty:
@@ -474,10 +477,12 @@ def main():
         progress = st.progress(0)
         
         for i, strat in enumerate(strategies):
+            # --- シード値を引数として渡す ---
             sim = RealWorldSupplySimulation(
                 strategy=strat,
                 shop_config_df=edited_shops_df,
                 item_config_df=edited_items_df,
+                random_seed=seed_val,  # ★ここをUIからの値に変更
                 demand_std_scale=demand_std,
                 transport_threshold=threshold,
                 transport_cost_unit=cost_unit
@@ -536,6 +541,7 @@ def main():
             width = 2.5 if s == 'New Optimization' else 1.5
             ax1.plot(results[s]["CumProfit"], label=s, color=colors[s], alpha=alpha, linewidth=width)
             ax2.plot(results[s]["DailyWaste"], label=s, color=colors[s], alpha=alpha, linewidth=width)
+        
         ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
         ax1.set_title("累積利益の推移 (高いほど良い)")
         ax1.set_ylabel("利益 (円)")
