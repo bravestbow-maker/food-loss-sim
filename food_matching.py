@@ -5,10 +5,9 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import os
 import urllib.request
-from pulp import LpProblem, LpVariable, LpMinimize, lpSum, LpInteger, PULP_CBC_CMD
 
 # ---------------------------------------------------------
-# 日本語フォント設定 (Streamlit Cloud対応)
+# 1. フォント設定 (Streamlit Cloud対応)
 # ---------------------------------------------------------
 def setup_japanese_font():
     url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf"
@@ -21,375 +20,324 @@ def setup_japanese_font():
 setup_japanese_font()
 
 # ---------------------------------------------------------
-# ページ設定
+# 2. アプリ設定
 # ---------------------------------------------------------
-st.set_page_config(layout="wide", page_title="食品ロス削減モデル - 動的シミュレーション")
+st.set_page_config(layout="wide", page_title="食品サプライチェーン動的シミュレーター")
 
 # ---------------------------------------------------------
-# シミュレーションモデル (先行研究ロジック統合版)
+# 3. シミュレーションモデル (実用運用版)
 # ---------------------------------------------------------
-class FoodSupplySimulation:
-    def __init__(self, strategy='LP', random_seed=42, 
-                 demand_std_scale=1.0, waste_risk_weight=0.1,
-                 shelf_life_dict=None, supply_mean=35,
-                 enable_auction=False, transfer_threshold=5):
+class RealWorldSupplySimulation:
+    def __init__(self, 
+                 random_seed=42, 
+                 demand_std_scale=1.0, 
+                 supply_mean=35,
+                 enable_transshipment=False, # 転送を行うか？
+                 transport_threshold=5,      # 何個以上なら送るか？(閾値)
+                 transport_cost_unit=10):    # 1個あたりの輸送コスト(円)
         
-        self.strategy = strategy
         self.shops = ['大学会館店', 'つくば駅前店', 'ひたち野牛久店', '研究学園店']
         self.items = ['トマト', '牛乳', 'パン']
         self.rng = np.random.default_rng(random_seed)
         
-        # 在庫データ (Wholesaler Inventory)
-        self.current_stock = pd.DataFrame(columns=['stock_id', 'item', 'stock_quantity', 'remaining_shelf_life'])
+        # ★重要変更点1: 在庫データに「retail_store」を追加 (所在管理)
+        self.current_stock = pd.DataFrame(columns=[
+            'stock_id', 'retail_store', 'item', 'stock_quantity', 'remaining_shelf_life'
+        ])
         self.next_stock_id = 1
         
-        # 記録用
-        self.total_waste = 0
-        self.total_sales = 0
-        self.transferred_count = 0 # 店舗間転送数
+        # KPI管理
+        self.total_waste_count = 0
+        self.total_sales_count = 0
+        self.total_transport_cost = 0 # 輸送コスト累計(円)
         
-        # パラメータ
+        # 設定パラメータ
         self.WEEKLY_DEMAND_PATTERN = [1.0, 0.9, 0.9, 1.0, 1.2, 1.4, 1.3]
         self.demand_std_scale = demand_std_scale
-        self.waste_risk_weight = waste_risk_weight
-        self.shelf_life_dict = shelf_life_dict if shelf_life_dict else {'トマト': 5, '牛乳': 7, 'パン': 4}
+        self.shelf_life_dict = {'トマト': 5, '牛乳': 7, 'パン': 4}
         self.supply_mean = supply_mean
         
-        # ★先行研究に基づく拡張機能スイッチ
-        self.enable_auction = enable_auction     # オークション再配分を行うか
-        self.transfer_threshold = transfer_threshold # 転送の最小ロット(閾値) 
+        # 先行研究パラメータ
+        self.enable_transshipment = enable_transshipment
+        self.transport_threshold = transport_threshold
+        self.transport_cost_unit = transport_cost_unit
 
-    def get_min_shelf_life(self, shop):
-        if shop in ['大学会館店', 'つくば駅前店']: return 3
-        return 1
-
-    def add_stock(self, day):
-        # 日曜入荷なし
-        if (day - 1) % 7 == 6: return 
-        for item in self.items:
-            qty = max(0, int(self.rng.normal(self.supply_mean, 10)))
-            full_life = self.shelf_life_dict[item]
-            delay = int(self.rng.exponential(1.2))
-            life = max(1, full_life - delay)
-            if qty > 0:
-                new_stock = pd.DataFrame([{
-                    'stock_id': self.next_stock_id,
-                    'item': item,
-                    'stock_quantity': qty,
-                    'remaining_shelf_life': life
-                }])
-                self.current_stock = pd.concat([self.current_stock, new_stock], ignore_index=True)
-                self.next_stock_id += 1
-
-    def generate_demand(self, day):
+    # 需要期待値の計算 (予測に使用)
+    def get_expected_demand(self, shop, item, day):
         weekday = (day - 1) % 7
         factor = self.WEEKLY_DEMAND_PATTERN[weekday]
-        rows = []
+        scale = {'大学会館店': 1.5, 'つくば駅前店': 1.0, 'ひたち野牛久店': 0.6, '研究学園店': 0.8}[shop]
+        base = {'トマト': 8, '牛乳': 6, 'パン': 8}[item]
+        return base * scale * factor
+
+    # 朝の入荷処理 (各店舗へ個別に納品)
+    def inbound_process(self, day):
+        if (day - 1) % 7 == 6: return # 日曜は入荷なし
+
         for shop in self.shops:
-            scale = {'大学会館店': 1.5, 'つくば駅前店': 1.0, 'ひたち野牛久店': 0.6, '研究学園店': 0.8}[shop]
             for item in self.items:
-                base = {'トマト': 8, '牛乳': 6, 'パン': 8}[item]
-                std_dev = 4 * self.demand_std_scale
-                qty = max(0, int(self.rng.normal(base * scale * factor, std_dev)))
-                if qty > 0:
-                    rows.append({'retail_store': shop, 'item': item, 'demand_quantity': qty})
-        return pd.DataFrame(rows)
+                # 発注量の決定 (需要予測 + 少しの余分) - ここで「誤差」が生まれる
+                expected = self.get_expected_demand(shop, item, day)
+                # 平均入荷量パラメータを加味
+                order_qty = max(0, int(self.rng.normal(expected * (self.supply_mean/30), 5)))
+                
+                if order_qty > 0:
+                    full_life = self.shelf_life_dict[item]
+                    delay = int(self.rng.exponential(1.0)) # 配送遅延
+                    life = max(1, full_life - delay)
+                    
+                    self._add_stock_record(shop, item, order_qty, life)
 
-    def solve_lp(self, demand):
-        # 既存のLPロジック (初期配分)
-        stock = self.current_stock.copy()
-        stock['risk'] = 1 / (stock['remaining_shelf_life'] + self.waste_risk_weight)
-        prob = LpProblem("Dist_Opt", LpMinimize)
-        x = {}
-        for i in stock.index:
-            for j in demand.index:
-                if stock.at[i, 'item'] != demand.at[j, 'item']: continue
-                if stock.at[i, 'remaining_shelf_life'] < self.get_min_shelf_life(demand.at[j, 'retail_store']): continue
-                x[i, j] = LpVariable(f"x_{i}_{j}", 0, None, LpInteger)
-        
-        prob += lpSum((stock.at[i, 'stock_quantity'] - lpSum(x[i, j] for j in demand.index if (i, j) in x)) * stock.at[i, 'risk'] for i in stock.index)
-        
-        for i in stock.index: prob += lpSum(x[i, j] for j in demand.index if (i, j) in x) <= stock.at[i, 'stock_quantity']
-        for j in demand.index: prob += lpSum(x[i, j] for i in stock.index if (i, j) in x) <= demand.at[j, 'demand_quantity']
-        
-        prob.solve(PULP_CBC_CMD(msg=0))
-        return {(i, j): v.value() for (i, j), v in x.items() if v.value() > 0}
+    def _add_stock_record(self, shop, item, qty, life):
+        new_row = {
+            'stock_id': self.next_stock_id,
+            'retail_store': shop, # ★店舗を指定して追加
+            'item': item,
+            'stock_quantity': qty,
+            'remaining_shelf_life': life
+        }
+        self.current_stock = pd.concat([self.current_stock, pd.DataFrame([new_row])], ignore_index=True)
+        self.next_stock_id += 1
 
-    def solve_fifo(self, demand, random=False):
-        shipment = {}
-        stock = self.current_stock.copy()
-        demand_idx = demand.index.tolist()
-        self.rng.shuffle(demand_idx)
+    # ---------------------------------------------------------
+    # ★先行研究に基づく「プロアクティブ転送」ロジック
+    # ---------------------------------------------------------
+    def run_transshipment(self, day):
+        if not self.enable_transshipment: return 0
+        
+        transferred_count = 0
+        
         for item in self.items:
-            stock_idx = stock[stock['item'] == item].index.tolist()
-            if random: self.rng.shuffle(stock_idx)
-            else: stock_idx.sort(key=lambda i: stock.at[i, 'remaining_shelf_life'])
+            # 1. 送り手(Sender)と受け手(Receiver)の探索
+            senders = []
+            receivers = []
             
-            for j in demand_idx:
-                if demand.at[j, 'item'] != item: continue
-                need = demand.at[j, 'demand_quantity']
-                min_life = self.get_min_shelf_life(demand.at[j, 'retail_store'])
-                for i in stock_idx:
-                    if need <= 0: break
-                    if stock.at[i, 'stock_quantity'] <= 0: continue
-                    if stock.at[i, 'remaining_shelf_life'] < min_life: continue
-                    amount = min(need, stock.at[i, 'stock_quantity'])
-                    shipment[i, j] = shipment.get((i, j), 0) + amount
-                    stock.at[i, 'stock_quantity'] -= amount
-                    need -= amount
-        return shipment
-
-    # ---------------------------------------------------------
-    # ★先行研究[3]に基づくオークション型・在庫再配分 (Lateral Transshipment)
-    # ---------------------------------------------------------
-    def run_auction_redistribution(self, initial_shipment, demand_df):
-        """
-        初期配分後に、需要予測とのギャップに基づいて店舗間で在庫を融通する。
-        「入札(Bid)」メカニズムを用い、必要度の高い店舗へ優先的に転送する。
-        """
-        # 1. 現在の配分状況を整理 (Store -> Item -> Quantity)
-        store_inventory = {shop: {item: 0 for item in self.items} for shop in self.shops}
-        shipment_map = {} # (stock_id, demand_id) -> qty の逆引き用などを保持したいが、簡易的に再構築
-        
-        # shipmentは {(stock_id, demand_id): qty} なので、これを展開して分析
-        # どの店にどれだけ届く予定か集計
-        for (s_id, d_id), qty in initial_shipment.items():
-            shop = demand_df.at[d_id, 'retail_store']
-            item = demand_df.at[d_id, 'item']
-            store_inventory[shop][item] += qty
-
-        # 2. オークション開催 (品目ごとに実施)
-        adjusted_shipment = initial_shipment.copy()
-        
-        for item in self.items:
-            sellers = [] # 余剰店舗
-            buyers = []  # 不足店舗 (入札者)
-
             for shop in self.shops:
-                allocated = store_inventory[shop][item]
-                # その店のその商品の総需要
-                shop_demand = demand_df[(demand_df['retail_store'] == shop) & (demand_df['item'] == item)]['demand_quantity'].sum()
+                # 現在の在庫
+                stock_df = self.current_stock[
+                    (self.current_stock['retail_store'] == shop) & 
+                    (self.current_stock['item'] == item)
+                ]
+                current_qty = stock_df['stock_quantity'].sum()
                 
-                diff = allocated - shop_demand
+                # 明日の需要予測 (Proactive: 未来を見る)
+                next_demand = self.get_expected_demand(shop, item, day + 1)
                 
-                if diff > self.transfer_threshold: # 閾値[2]以上の余剰があれば「売り手」
-                    sellers.append({'shop': shop, 'surplus': diff})
-                elif diff < 0: # 不足していれば「買い手」として入札
-                    # ★入札額(Bid)の計算 [3]
-                    # 不足度が大きいほど、高い値を付ける (Bid = 不足数 * 緊急度係数)
-                    shortage = abs(diff)
-                    bid_price = shortage * 10 
-                    buyers.append({'shop': shop, 'bid': bid_price, 'shortage': shortage})
-
-            # 入札額が高い順にソート (優先権)
-            buyers.sort(key=lambda x: x['bid'], reverse=True)
-
-            # 3. 転送マッチング (Greedy)
-            for buyer in buyers:
-                if buyer['shortage'] <= 0: continue
+                balance = current_qty - next_demand
                 
-                for seller in sellers:
-                    if seller['surplus'] <= 0: continue
+                if balance > 0:
+                    # 余剰あり: 送り手候補
+                    # ★重要制約: 賞味期限が残り2日未満のものは送らない (輸送リスク)
+                    valid_stock = stock_df[stock_df['remaining_shelf_life'] >= 2]
+                    sendable = valid_stock['stock_quantity'].sum()
                     
-                    # 転送量決定
-                    transfer_qty = min(seller['surplus'], buyer['shortage'])
+                    # 自分の明日の分は確保
+                    surplus = max(0, sendable - next_demand)
                     
-                    # 閾値チェック (少量の移動はコスト倒れなのでしない)
-                    if transfer_qty < self.transfer_threshold: continue
+                    if surplus > 0:
+                        senders.append({'shop': shop, 'qty': surplus, 'df_index': valid_stock.index})
+                        
+                elif balance < 0:
+                    # 不足あり: 受け手候補
+                    shortage = abs(balance)
+                    urgency = shortage / (next_demand + 1)
+                    receivers.append({'shop': shop, 'qty': shortage, 'urgency': urgency})
 
-                    # ★配送計画の書き換え (Re-routing)
-                    # seller向けの商品を、buyer向けに付け替える処理
-                    # 簡易実装: adjusted_shipment の中から seller行きの配送を探して buyer行きとみなす
-                    # (厳密なID付け替えは複雑なため、ここでは集計上の転送数を記録し、販売処理で調整する)
+            # 2. マッチング (緊急度が高い順)
+            receivers.sort(key=lambda x: x['urgency'], reverse=True)
+            senders.sort(key=lambda x: x['qty'], reverse=True)
+            
+            for receiver in receivers:
+                for sender in senders:
+                    if sender['qty'] <= 0 or receiver['qty'] <= 0: continue
                     
-                    self.transferred_count += transfer_qty
-                    seller['surplus'] -= transfer_qty
-                    buyer['shortage'] -= transfer_qty
+                    amount = min(sender['qty'], receiver['qty'])
                     
-                    # Store在庫情報の更新 (販売計算用)
-                    store_inventory[seller['shop']][item] -= transfer_qty
-                    store_inventory[buyer['shop']][item] += transfer_qty
+                    # ★重要制約: 閾値 (Threshold)
+                    # まとまった量でなければ輸送コスト倒れになるので送らない
+                    if amount < self.transport_threshold: continue
+                    
+                    # 転送実行
+                    transferred_count += amount
+                    sender['qty'] -= amount
+                    receiver['qty'] -= amount
+                    
+                    # コスト加算
+                    self.total_transport_cost += amount * self.transport_cost_unit
+                    
+                    # データ更新 (所在地の書き換え)
+                    remaining = amount
+                    for idx in sender['df_index']:
+                        if remaining <= 0: break
+                        have = self.current_stock.at[idx, 'stock_quantity']
+                        
+                        if have <= remaining:
+                            self.current_stock.at[idx, 'retail_store'] = receiver['shop']
+                            remaining -= have
+                        else:
+                            # 分割処理
+                            self.current_stock.at[idx, 'stock_quantity'] -= remaining
+                            new_row = self.current_stock.loc[idx].copy()
+                            new_row['stock_quantity'] = remaining
+                            new_row['retail_store'] = receiver['shop']
+                            new_row['stock_id'] = self.next_stock_id
+                            self.next_stock_id += 1
+                            self.current_stock = pd.concat([self.current_stock, pd.DataFrame([new_row])], ignore_index=True)
+                            remaining = 0
+                            
+        return transferred_count
 
-                    if buyer['shortage'] <= 0: break
-        
-        return store_inventory
-
+    # 1日のステップ実行
     def step(self, day):
-        self.add_stock(day)
+        # 1. 朝: 入荷
+        self.inbound_process(day)
         
-        # 期限切れ廃棄
+        # 2. 日中: 販売
+        sold_today = 0
+        demand_rows = []
+        for shop in self.shops:
+            for item in self.items:
+                expected = self.get_expected_demand(shop, item, day)
+                qty = max(0, int(self.rng.normal(expected, 4 * self.demand_std_scale)))
+                if qty > 0:
+                    demand_rows.append({'shop': shop, 'item': item, 'qty': qty})
+        
+        # 需要に対して在庫を引き当てる (FIFO)
+        for d in demand_rows:
+            shop, item, need = d['shop'], d['item'], d['qty']
+            targets = self.current_stock[
+                (self.current_stock['retail_store'] == shop) & 
+                (self.current_stock['item'] == item)
+            ].sort_values('remaining_shelf_life')
+            
+            for idx, stock in targets.iterrows():
+                if need <= 0: break
+                if stock['remaining_shelf_life'] < 1: continue # 期限切れは売れない
+                
+                have = stock['stock_quantity']
+                sell = min(need, have)
+                self.current_stock.at[idx, 'stock_quantity'] -= sell
+                sold_today += sell
+                need -= sell
+
+        self.total_sales_count += sold_today
+
+        # 3. 夕方: 店舗間転送
+        transferred = self.run_transshipment(day)
+
+        # 4. 夜: 廃棄 & 日付更新
         expired = self.current_stock['remaining_shelf_life'] <= 0
         waste_today = self.current_stock.loc[expired, 'stock_quantity'].sum()
-        self.total_waste += waste_today
-        self.current_stock = self.current_stock[~expired]
+        self.total_waste_count += waste_today
         
-        demand = self.generate_demand(day)
-        shipment = {}
-        
-        # 1. 初期配分 (LP or FIFO)
-        if self.strategy == 'LP':
-            shipment = self.solve_lp(demand)
-        elif self.strategy == 'FIFO':
-            shipment = self.solve_fifo(demand, random=False)
-        elif self.strategy == 'Random':
-            shipment = self.solve_fifo(demand, random=True)
-
-        # 2. ★オークション再配分 (プロアクティブ転送)
-        # オークション有効時、店舗在庫(store_inv)は転送後の状態になる
-        if self.enable_auction:
-            final_store_inv = self.run_auction_redistribution(shipment, demand)
-            # 販売計算のために簡易的に shipment を無視して store_inv を使うロジックへ
-            # (既存コードの構造上、shipment辞書をベースに在庫を減らす必要があるため、ここで販売数を計算)
-            
-            sold_count = 0
-            # 店舗ごとに「持ってる在庫」と「需要」を突き合わせて販売数を確定
-            for shop in self.shops:
-                for item in self.items:
-                    qty_held = final_store_inv[shop][item]
-                    qty_need = demand[(demand['retail_store']==shop) & (demand['item']==item)]['demand_quantity'].sum()
-                    sold = min(qty_held, qty_need)
-                    sold_count += sold
-                    
-                    # 元の大元の在庫(self.current_stock)から減らす処理
-                    # どの在庫IDを減らすかは「古い順」に減らすと仮定(FIFO消費)
-                    self._reduce_stock_by_item(item, sold)
-
-            self.total_sales += sold_count
-
-        else:
-            # 従来通りの販売計算 (再配分なし)
-            shipped_today = 0
-            for (i, j), qty in shipment.items():
-                self.current_stock.at[i, 'stock_quantity'] -= qty
-                shipped_today += qty
-            self.total_sales += shipped_today
-
-        # 日付更新
+        self.current_stock = self.current_stock[
+            (self.current_stock['stock_quantity'] > 0) & 
+            (self.current_stock['remaining_shelf_life'] > 0)
+        ]
         self.current_stock['remaining_shelf_life'] -= 1
-        self.current_stock = self.current_stock[self.current_stock['stock_quantity'] > 0]
         
-        return self.total_waste, self.total_sales, self.transferred_count
-
-    def _reduce_stock_by_item(self, item, amount):
-        """在庫IDに関わらず、指定アイテムを指定数だけ減らす (FIFO的消費)"""
-        targets = self.current_stock[self.current_stock['item'] == item].sort_values('remaining_shelf_life')
-        for idx in targets.index:
-            if amount <= 0: break
-            have = self.current_stock.at[idx, 'stock_quantity']
-            reduce_val = min(have, amount)
-            self.current_stock.at[idx, 'stock_quantity'] -= reduce_val
-            amount -= reduce_val
+        return waste_today, transferred
 
 # ---------------------------------------------------------
-# メイン処理 UI
+# 4. メインUI
 # ---------------------------------------------------------
 def main():
-    st.title("社会工学類 課題制作：食品ロス削減シミュレーション")
+    st.title("動的サプライチェーンシミュレーション (実用運用版)")
     st.markdown("""
-    **研究目的:** 需要予測誤差による食品ロスを、**「動的在庫転送 (Lateral Transshipment)」** と **「オークション理論」** を用いて削減できるか検証する。
+    先行研究 (Chen et al., Olsson) に基づき、**「所在管理」「品質制約」「輸送コスト」** を厳密に組み込んだモデル。
+    「従来型（転送なし）」と「提案手法（プロアクティブ転送）」を比較検証する。
     """)
-    
-    # --- パラメータ ---
-    st.sidebar.header("シミュレーション条件")
-    
-    with st.sidebar.expander("1. 基本設定", expanded=True):
-        days = st.slider("期間 (日)", 10, 60, 30, 5)
-        seed = st.number_input("乱数シード", value=42)
 
-    with st.sidebar.expander("2. 先行研究ロジックの適用", expanded=True):
-        use_auction = st.checkbox("オークション型 再配分を導入", value=True, help="先行研究[3]に基づく。店舗間で在庫を融通します。")
-        threshold = st.slider("転送閾値 (Threshold)", 1, 10, 5, help="先行研究[2]に基づく。これ以下の不足/余剰では転送コストを考慮して移動しません。")
-
-    with st.sidebar.expander("3. 需給バランス"):
-        supply = st.slider("平均入荷数", 20, 60, 35)
-        std_scale = st.slider("需要変動倍率", 0.0, 3.0, 1.0)
+    # --- パラメータ設定 ---
+    st.sidebar.header("条件設定")
     
-    # 実行
-    if st.sidebar.button("シミュレーション開始", type="primary"):
-        # 比較のため、今回は「LP (従来)」と「LP + Auction (提案)」を比較する形にする
-        # または、ユーザーが選んだ設定で走らせる
+    with st.sidebar.expander("① 基本設定", expanded=True):
+        days = st.slider("シミュレーション期間 (日)", 10, 60, 30)
+        supply_mean = st.slider("基本入荷基準値", 20, 50, 30)
+        demand_std = st.slider("需要のばらつき倍率", 0.0, 2.0, 1.0)
+    
+    with st.sidebar.expander("② 転送・コスト設定 (先行研究)", expanded=True):
+        threshold = st.slider("転送閾値 (これ以下は送らない)", 1, 10, 5, help="Olssonの閾値制御")
+        cost_unit = st.number_input("1個あたりの輸送コスト (円)", value=30, help="人件費・燃料費")
+
+    if st.sidebar.button("検証開始", type="primary"):
+        # 2つのシナリオを比較実行
+        scenarios = [
+            ("従来モデル (転送なし)", False),
+            ("提案モデル (転送あり)", True)
+        ]
         
-        strategies = ['Random', 'LP'] # 比較対象
-        results = {s: {'days': [], 'waste': [], 'sales': [], 'trans': []} for s in strategies}
-        
+        results = []
         progress = st.progress(0)
-        status = st.empty()
-
-        for i, s in enumerate(strategies):
-            # 戦略に応じてAuctionのON/OFFを切り替えるなど柔軟に設定
-            # 今回は「LP」を選んだ時だけ、チェックボックスの状態を反映させる
-            is_auction = use_auction if s == 'LP' else False
-            
-            label = f"{s} + 再配分" if (s == 'LP' and is_auction) else s
-            status.text(f"計算中... モデル: {label}")
-            
-            sim = FoodSupplySimulation(
-                strategy=s, 
-                random_seed=seed,
-                supply_mean=supply,
-                demand_std_scale=std_scale,
-                enable_auction=is_auction,
-                transfer_threshold=threshold
+        
+        for i, (name, enable) in enumerate(scenarios):
+            sim = RealWorldSupplySimulation(
+                supply_mean=supply_mean,
+                demand_std_scale=demand_std,
+                enable_transshipment=enable,
+                transport_threshold=threshold,
+                transport_cost_unit=cost_unit
             )
             
+            daily_waste = []
             for d in range(1, days + 1):
-                waste, sales, trans = sim.step(d)
-                results[s]['days'].append(d)
-                results[s]['waste'].append(waste)
-                results[s]['sales'].append(sales)
-                results[s]['trans'].append(trans)
-                
-            progress.progress((i + 1) / len(strategies))
+                w, _ = sim.step(d)
+                daily_waste.append(w)
+            
+            results.append({
+                "Name": name,
+                "Waste": sim.total_waste_count,
+                "Sales": sim.total_sales_count,
+                "TransportCost": sim.total_transport_cost,
+                "DailyWaste": daily_waste
+            })
+            progress.progress((i + 1) / len(scenarios))
         
-        status.empty()
         progress.empty()
-
+        
         # --- 結果表示 ---
-        st.subheader("分析結果")
+        base = results[0]
+        prop = results[1]
         
-        # サマリーテーブル作成
-        summary_data = []
-        for s in strategies:
-            is_auction = use_auction if s == 'LP' else False
-            name = f"{s} (再配分あり)" if (s == 'LP' and is_auction) else s
-            
-            w = results[s]['waste'][-1]
-            sl = results[s]['sales'][-1]
-            tr = sum(results[s]['trans'])
-            total = w + sl
-            rate = (w / total * 100) if total > 0 else 0
-            
-            summary_data.append([name, int(sl), int(w), f"{rate:.1f}%", int(tr)])
-            
-        df_res = pd.DataFrame(summary_data, columns=['モデル', '累積売上', '累積廃棄', '廃棄率', '総転送数'])
-        st.table(df_res)
+        # 1. 廃棄削減効果
+        waste_diff = base["Waste"] - prop["Waste"]
+        rate = (waste_diff / base["Waste"] * 100) if base["Waste"] > 0 else 0
         
-        # グラフ
-        col1, col2 = st.columns(2)
-        with col1:
-            fig1, ax1 = plt.subplots()
-            for s in strategies:
-                label = f"{s} (再配分あり)" if (s == 'LP' and use_auction) else s
-                ax1.plot(results[s]['days'], results[s]['waste'], marker='o', markersize=4, label=label)
-            ax1.set_title("累積廃棄数の推移")
-            ax1.set_xlabel("日数")
-            ax1.set_ylabel("廃棄数")
-            ax1.legend()
-            ax1.grid(True, linestyle='--', alpha=0.6)
-            st.pyplot(fig1)
+        # 2. 経済効果 (簡易計算: 廃棄損1個100円 - 輸送費)
+        WASTE_COST_PER_UNIT = 100 # 廃棄単価(円)
+        base_loss = base["Waste"] * WASTE_COST_PER_UNIT
+        prop_loss = (prop["Waste"] * WASTE_COST_PER_UNIT) + prop["TransportCost"]
+        cost_saving = base_loss - prop_loss
 
-        with col2:
-            fig2, ax2 = plt.subplots()
-            # 転送数の推移 (LPのみ)
-            if use_auction:
-                ax2.bar(results['LP']['days'], results['LP']['trans'], color='green', alpha=0.6, label="転送実行数")
-                ax2.set_title("日ごとの店舗間転送数 (LPモデル)")
-                ax2.set_xlabel("日数")
-                ax2.legend()
-                ax2.grid(True, axis='y', linestyle='--', alpha=0.6)
-                st.pyplot(fig2)
-            else:
-                st.info("再配分OFFのため転送データはありません")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("廃棄削減数", f"▲{int(waste_diff)}個", f"{rate:.1f}% 削減")
+        col2.metric("輸送コスト発生", f"{int(prop['TransportCost']):,} 円", f"単価 {cost_unit}円")
+        col3.metric("最終経済効果 (損益改善)", f"{int(cost_saving):,} 円", 
+                    help="廃棄コスト(100円/個)の削減分から、輸送コストを引いた実質利益")
+
+        # グラフ
+        st.subheader("日次廃棄量の推移")
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(base["DailyWaste"], label="従来モデル", linestyle='--', color='gray')
+        ax.plot(prop["DailyWaste"], label="提案モデル", color='red', linewidth=2)
+        ax.set_ylabel("廃棄数 (個)")
+        ax.set_xlabel("経過日数")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        st.pyplot(fig)
+        
+        # 考察の自動生成
+        if cost_saving > 0:
+            st.success(f"""
+            **検証成功:** 輸送コスト({prop['TransportCost']:,}円)をかけて在庫を転送した結果、
+            それを上回る廃棄コスト削減効果が得られました。
+            Olssonの研究にある通り、適切な閾値({threshold}個)の設定が利益最大化に貢献しています。
+            """)
+        else:
+            st.error(f"""
+            **検証課題:** 廃棄は減りましたが、輸送コストがかかりすぎて経済的にはマイナスです。
+            「転送閾値」をもっと上げるか、より効率的な配送計画が必要です。
+            """)
 
 if __name__ == "__main__":
     main()
