@@ -536,7 +536,7 @@ def main():
             width = 2.5 if s == 'New Optimization' else 1.5
             ax1.plot(results[s]["CumProfit"], label=s, color=colors[s], alpha=alpha, linewidth=width)
             ax2.plot(results[s]["DailyWaste"], label=s, color=colors[s], alpha=alpha, linewidth=width)
-
+        ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
         ax1.set_title("累積利益の推移 (高いほど良い)")
         ax1.set_ylabel("利益 (円)")
         ax1.set_xlabel("経過日数")
