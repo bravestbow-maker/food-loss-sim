@@ -265,6 +265,18 @@ class RealWorldSupplySimulation:
         self.current_stock.reset_index(drop=True, inplace=True)
 
         for item in self.items:
+            # --- ★ 追加: コスト対効果の判定 ---
+            # 輸送費が (売価 + 廃棄回避コスト) を上回るなら、転送しない方がマシ（赤字になる）
+            unit_price = self.item_props[item]['price']
+            disposal_cost = self.item_props[item]['disposal']
+            
+            # 転送による経済的価値 = 売上の確保 + 廃棄コストの回避
+            economic_value = unit_price + disposal_cost
+            
+            if self.transport_cost_unit > economic_value:
+                continue # 輸送費が高すぎて割に合わないためスキップ
+            # ------------------------------------
+
             senders = []
             receivers = []
             
@@ -457,7 +469,6 @@ def main():
         )
 
     with st.sidebar.expander("② シミュレーション条件", expanded=False):
-        # ★ここを変更: 60 -> 365
         days = st.slider("期間 (日)", 10, 365, 30)
         demand_std = st.slider("需要のばらつき倍率", 0.0, 2.0, 1.0)
         threshold = st.slider("転送閾値 (New Model用)", 1, 10, 5)
