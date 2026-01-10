@@ -7,7 +7,7 @@ import os
 import urllib.request
 
 # ---------------------------------------------------------
-# 1. フォント設定 (Streamlit Cloud対応)
+# 1. フォント設定
 # ---------------------------------------------------------
 def setup_japanese_font():
     url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf"
@@ -25,12 +25,12 @@ setup_japanese_font()
 st.set_page_config(layout="wide", page_title="食品サプライチェーン動的シミュレーター")
 
 # ---------------------------------------------------------
-# 3. シミュレーションモデル (動的リスト対応版)
+# 3. シミュレーションモデル (設定受取対応版)
 # ---------------------------------------------------------
 class RealWorldSupplySimulation:
     def __init__(self, 
-                 shop_list,          # ★引数追加: 店舗リスト
-                 item_list,          # ★引数追加: 商品リスト
+                 shop_config_df,     # ★変更: 店舗設定DFを受け取る
+                 item_config_df,     # ★変更: 商品設定DFを受け取る
                  random_seed=42, 
                  demand_std_scale=1.0, 
                  supply_mean=35,
@@ -40,37 +40,19 @@ class RealWorldSupplySimulation:
         
         self.rng = np.random.default_rng(random_seed)
         
-        # ★ユーザー入力されたリストを使用
-        self.shops = shop_list
-        self.items = item_list
-        
-        # ★店舗・商品の特性を自動生成 (ハードコード廃止)
-        # 既存の名前なら固定値、新しい名前ならランダム生成する柔軟な設計
-        self.shop_scales = {}
-        for shop in self.shops:
-            # デフォルト設定(既知の店)
-            defaults = {'大学会館店': 1.5, 'つくば駅前店': 1.0, 'ひたち野牛久店': 0.6, '研究学園店': 0.8}
-            # 未知の店なら0.5~1.5倍の範囲でランダム設定
-            self.shop_scales[shop] = defaults.get(shop, self.rng.uniform(0.5, 1.5))
+        # 設定データフレームから情報を抽出
+        # 1. 店舗情報
+        self.shops = shop_config_df['店舗名'].tolist()
+        self.shop_scales = dict(zip(shop_config_df['店舗名'], shop_config_df['規模倍率']))
 
+        # 2. 商品情報
+        self.items = item_config_df['商品名'].tolist()
         self.item_props = {}
-        for item in self.items:
-            # デフォルト設定(既知の商品)
-            # base:基本需要, life:賞味期限
-            defaults = {
-                'トマト': {'base': 8, 'life': 5},
-                '牛乳':   {'base': 6, 'life': 7},
-                'パン':   {'base': 8, 'life': 4}
+        for _, row in item_config_df.iterrows():
+            self.item_props[row['商品名']] = {
+                'life': int(row['賞味期限(日)']),
+                'base': int(row['基本需要(個)'])
             }
-            if item in defaults:
-                self.item_props[item] = defaults[item]
-            else:
-                # 未知の商品ならランダム生成
-                # 需要: 5~12, 賞味期限: 2~7日
-                self.item_props[item] = {
-                    'base': self.rng.integers(5, 12),
-                    'life': self.rng.integers(2, 7)
-                }
 
         # 在庫データ
         self.current_stock = pd.DataFrame(columns=[
@@ -95,7 +77,6 @@ class RealWorldSupplySimulation:
         weekday = (day - 1) % 7
         factor = self.WEEKLY_DEMAND_PATTERN[weekday]
         
-        # ★自動生成されたプロパティ辞書から取得
         scale = self.shop_scales[shop]
         base = self.item_props[item]['base']
         
@@ -108,11 +89,9 @@ class RealWorldSupplySimulation:
         for shop in self.shops:
             for item in self.items:
                 expected = self.get_expected_demand(shop, item, day)
-                # 入荷量のゆらぎ
                 order_qty = max(0, int(self.rng.normal(expected * (self.supply_mean/30), 5)))
                 
                 if order_qty > 0:
-                    # ★辞書から賞味期限を取得
                     full_life = self.item_props[item]['life']
                     delay = int(self.rng.exponential(1.0))
                     life = max(1, full_life - delay)
@@ -254,25 +233,43 @@ class RealWorldSupplySimulation:
 # 4. メインUI
 # ---------------------------------------------------------
 def main():
-    st.title("動的サプライチェーンシミュレーション (実用運用版)")
-    st.markdown("""
-    先行研究 (Chen et al., Olsson) に基づく「動的転送」モデル。
-    店舗や商品を自由に追加して、ネットワーク規模の変化による影響を検証できます。
-    """)
+    st.title("動的サプライチェーンシミュレーション (詳細設定版)")
+    st.markdown("店舗リストや商品スペック（賞味期限・需要）を自由に変更してシミュレーションできます。")
 
     st.sidebar.header("条件設定")
     
-    # ★追加: 編集可能な店舗・商品リスト
-    with st.sidebar.expander("① ネットワーク構成 (編集可能)", expanded=True):
-        default_shops = "大学会館店, つくば駅前店, ひたち野牛久店, 研究学園店"
-        default_items = "トマト, 牛乳, パン"
+    # --- ネットワーク構成 (編集可能テーブル) ---
+    with st.sidebar.expander("① ネットワーク詳細設定", expanded=True):
+        st.caption("下表を直接編集して、店舗や商品を追加・変更できます。")
         
-        shops_input = st.text_area("店舗名 (カンマ区切り)", value=default_shops, help="店舗を増やすと計算時間が増えます")
-        items_input = st.text_area("商品名 (カンマ区切り)", value=default_items, help="新しい商品を追加すると賞味期限はランダム設定されます")
+        # 1. 店舗設定データの作成
+        default_shops_data = {
+            '店舗名': ['大学会館店', 'つくば駅前店', 'ひたち野牛久店', '研究学園店'],
+            '規模倍率': [1.5, 1.0, 0.6, 0.8]
+        }
+        df_shops_default = pd.DataFrame(default_shops_data)
         
-        # リストに変換
-        shop_list = [s.strip() for s in shops_input.split(',') if s.strip()]
-        item_list = [s.strip() for s in items_input.split(',') if s.strip()]
+        st.markdown("**店舗設定**")
+        edited_shops_df = st.data_editor(
+            df_shops_default, 
+            num_rows="dynamic", # 行の追加削除を許可
+            key="editor_shops"
+        )
+        
+        # 2. 商品設定データの作成
+        default_items_data = {
+            '商品名': ['トマト', '牛乳', 'パン', 'おにぎり', '弁当'],
+            '賞味期限(日)': [5, 7, 4, 1, 1],
+            '基本需要(個)': [8, 6, 8, 20, 15]
+        }
+        df_items_default = pd.DataFrame(default_items_data)
+        
+        st.markdown("**商品設定**")
+        edited_items_df = st.data_editor(
+            df_items_default, 
+            num_rows="dynamic", # 行の追加削除を許可
+            key="editor_items"
+        )
 
     with st.sidebar.expander("② 基本設定", expanded=False):
         days = st.slider("シミュレーション期間 (日)", 10, 60, 30)
@@ -284,8 +281,9 @@ def main():
         cost_unit = st.number_input("1個あたりの輸送コスト (円)", value=30)
 
     if st.sidebar.button("検証開始", type="primary"):
-        if not shop_list or not item_list:
-            st.error("店舗名と商品名は少なくとも1つ以上入力してください。")
+        # 入力チェック
+        if edited_shops_df.empty or edited_items_df.empty:
+            st.error("店舗と商品は少なくとも1つ以上設定してください。")
             return
 
         scenarios = [("従来モデル", False), ("提案モデル", True)]
@@ -294,8 +292,8 @@ def main():
         
         for i, (name, enable) in enumerate(scenarios):
             sim = RealWorldSupplySimulation(
-                shop_list=shop_list,  # ★入力を渡す
-                item_list=item_list,  # ★入力を渡す
+                shop_config_df=edited_shops_df, # ★テーブルデータを渡す
+                item_config_df=edited_items_df, # ★テーブルデータを渡す
                 supply_mean=supply_mean,
                 demand_std_scale=demand_std,
                 enable_transshipment=enable,
@@ -328,7 +326,7 @@ def main():
 
         col1, col2, col3 = st.columns(3)
         col1.metric("廃棄削減数", f"▲{int(waste_diff)}個", f"{rate:.1f}% 削減")
-        col2.metric("輸送コスト", f"{int(prop['TransportCost']):,} 円", f"店舗数:{len(shop_list)}")
+        col2.metric("輸送コスト", f"{int(prop['TransportCost']):,} 円", f"商品数:{len(edited_items_df)}")
         col3.metric("経済効果", f"{int(cost_saving):,} 円", "廃棄削減 - 輸送費")
 
         st.subheader("日次廃棄量の推移")
@@ -337,10 +335,6 @@ def main():
         ax.plot(prop["DailyWaste"], label="提案モデル", color='red', linewidth=2)
         ax.legend()
         st.pyplot(fig)
-        
-        # 店舗数に応じたコメント
-        if len(shop_list) > 6:
-            st.info("💡 ヒント: 店舗数が多いほど、在庫転送のマッチング機会が増え、削減効果が高まりやすい傾向があります（スケールメリット）。")
 
 if __name__ == "__main__":
     main()
