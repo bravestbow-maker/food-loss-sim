@@ -26,11 +26,11 @@ setup_japanese_font()
 st.set_page_config(layout="wide", page_title="食品サプライチェーン経営シミュレーター")
 
 # ---------------------------------------------------------
-# 3. シミュレーションモデル (4戦略対応版)
+# 3. シミュレーションモデル (価格弾力性 対応版)
 # ---------------------------------------------------------
 class RealWorldSupplySimulation:
     def __init__(self, 
-                 strategy,           # ★戦略 (Random, FIFO, LP, New Model)
+                 strategy, 
                  shop_config_df,     
                  item_config_df,     
                  random_seed=42, 
@@ -45,7 +45,7 @@ class RealWorldSupplySimulation:
         self.shops = shop_config_df['店舗名'].tolist()
         self.shop_scales = dict(zip(shop_config_df['店舗名'], shop_config_df['規模倍率']))
 
-        # 2. 商品情報
+        # 2. 商品情報 (弾力性パラメータを追加)
         self.items = item_config_df['商品名'].tolist()
         self.item_props = {}
         for _, row in item_config_df.iterrows():
@@ -54,6 +54,8 @@ class RealWorldSupplySimulation:
                 'base_demand': int(row['基本需要(個)']),
                 'target_stock': int(row['発注基準(個)']),
                 'price': int(row['販売単価(円)']),
+                'base_price': int(row['基準価格(円)']),    # ★追加: 需要の基準となる価格
+                'elasticity': float(row['価格弾力性']),    # ★追加: 感度
                 'cost': int(row['仕入れ原価(円)']),
                 'disposal': int(row['廃棄コスト(円)'])
             }
@@ -84,12 +86,29 @@ class RealWorldSupplySimulation:
         self.transport_threshold = transport_threshold
         self.transport_cost_unit = transport_cost_unit
 
+    # ★修正: 価格弾力性を考慮した需要計算
     def get_expected_demand(self, shop, item, day):
         weekday = (day - 1) % 7
         factor = self.WEEKLY_DEMAND_PATTERN[weekday]
+        
+        # 1. 店舗規模 × 商品基本需要
         scale = self.shop_scales[shop]
-        base = self.item_props[item]['base_demand']
-        return base * scale * factor
+        base_demand = self.item_props[item]['base_demand']
+        
+        # 2. 価格弾力性による補正
+        # 需要 = 基本需要 * (設定価格 / 基準価格) ^ (-弾力性)
+        current_price = self.item_props[item]['price']
+        base_price = self.item_props[item]['base_price']
+        elasticity = self.item_props[item]['elasticity']
+        
+        # ゼロ除算回避
+        if base_price <= 0: base_price = 1
+        
+        price_ratio = current_price / base_price
+        # 弾力性が反映された需要倍率
+        price_factor = price_ratio ** (-elasticity)
+        
+        return base_demand * scale * factor * price_factor
 
     # ---------------------------------------------------------
     # 入荷プロセス (Inbound)
@@ -101,24 +120,22 @@ class RealWorldSupplySimulation:
         for shop in self.shops:
             for item in self.items:
                 # 戦略による発注精度の違い
+                # ★注意: 発注基準(target_stock)は固定値だが、需要予測が変わると在庫の減り方が変わるため
+                # 発注点方式では自動的に発注量が調整されていく
                 base_target = self.item_props[item]['target_stock']
                 scale = self.shop_scales[shop]
                 target_level = base_target * scale
                 
                 if self.strategy == 'Random':
-                    # Random戦略: 在庫状況を見ずに適当に発注する (精度が低い)
-                    # 目標在庫の 0.5倍〜1.5倍 の量をランダムに入荷
                     order_qty = int(self.rng.uniform(target_level * 0.5, target_level * 1.5))
                 else:
-                    # FIFO, LP, New Model: 発注点方式 (賢い発注)
-                    # 現在在庫を確認して、足りない分だけ発注
+                    # 発注点方式
                     current_stock_df = self.current_stock[
                         (self.current_stock['retail_store'] == shop) & 
                         (self.current_stock['item'] == item)
                     ]
                     current_qty = current_stock_df['stock_quantity'].sum()
                     needed_qty = target_level - current_qty
-                    # 誤差を含める
                     order_qty = max(0, int(self.rng.normal(needed_qty, target_level * 0.05)))
                 
                 if order_qty > 0:
@@ -146,29 +163,20 @@ class RealWorldSupplySimulation:
     # 転送プロセス (Transshipment)
     # ---------------------------------------------------------
     def run_transshipment(self, day):
-        # RandomとFIFOは転送を行わない
         if self.strategy in ['Random', 'FIFO']: return 0
-        
-        # LP戦略: 数理最適化ソルバーで転送決定
-        if self.strategy == 'LP':
-            return self.run_lp_optimization(day)
-            
-        # New Model: 提案手法（ヒューリスティック）で転送決定
-        if self.strategy == 'New Optimization':
-            return self.run_heuristic_optimization(day)
-            
+        if self.strategy == 'LP': return self.run_lp_optimization(day)
+        if self.strategy == 'New Optimization': return self.run_heuristic_optimization(day)
         return 0
 
-    # ★LP転送ロジック (Solver使用)
+    # LP転送ロジック
     def run_lp_optimization(self, day):
         transferred_count = 0
         new_transferred_stock = []
         self.current_stock.reset_index(drop=True, inplace=True)
 
         for item in self.items:
-            # 1. 各店舗の余剰と不足を計算
-            balances = {} # shop -> +/- qty
-            valid_indices = {} # shop -> list of indices
+            balances = {}
+            valid_indices = {}
             
             for shop in self.shops:
                 stock_df = self.current_stock[
@@ -178,11 +186,9 @@ class RealWorldSupplySimulation:
                 current_qty = stock_df['stock_quantity'].sum()
                 next_demand = self.get_expected_demand(shop, item, day + 1)
                 
-                # 転送可能な在庫 (期限2日以上)
                 valid_stock = stock_df[stock_df['remaining_shelf_life'] >= 2]
                 valid_indices[shop] = valid_stock.index.tolist()
                 
-                # LPは「全体最適」なので、明日の需要に対する過不足をそのまま使う
                 balance = current_qty - next_demand
                 balances[shop] = int(balance)
 
@@ -191,30 +197,20 @@ class RealWorldSupplySimulation:
             
             if not senders or not receivers: continue
 
-            # 2. LP問題の定義
             prob = LpProblem(f"Transshipment_{item}_{day}", LpMaximize)
-            
-            # 変数: x[sender][receiver] = 移動量
             x = LpVariable.dicts("route", (senders, receivers), 0, None, LpInteger)
             
-            # 目的関数: 転送による「救済価値」 - 「輸送コスト」
-            # 救済価値 = 販売単価 (売れるようになるから)
             unit_price = self.item_props[item]['price']
+            # 利益最大化 (売上確保価値 - 輸送コスト)
             prob += lpSum([x[s][r] * (unit_price - self.transport_cost_unit) for s in senders for r in receivers])
             
-            # 制約条件
             for s in senders:
-                # 送る量は余剰分を超えない
                 prob += lpSum([x[s][r] for r in receivers]) <= balances[s]
-                
             for r in receivers:
-                # 受け取る量は不足分を超えない
                 prob += lpSum([x[s][r] for s in senders]) <= abs(balances[r])
 
-            # ソルバー実行
             prob.solve(PULP_CBC_CMD(msg=0))
             
-            # 3. 結果の適用
             for s in senders:
                 for r in receivers:
                     amount = x[s][r].value()
@@ -226,7 +222,6 @@ class RealWorldSupplySimulation:
                         self.daily_transport_cost += t_cost
                         self.total_transport_cost += t_cost
                         
-                        # 在庫移動処理
                         remaining = amount
                         for idx in valid_indices[s]:
                             if remaining <= 0: break
@@ -254,7 +249,7 @@ class RealWorldSupplySimulation:
 
         return transferred_count
 
-    # ★New Model転送ロジック (提案手法: プロアクティブ + 閾値)
+    # New Model転送ロジック
     def run_heuristic_optimization(self, day):
         transferred_count = 0
         new_transferred_stock = []
@@ -272,7 +267,6 @@ class RealWorldSupplySimulation:
                 current_qty = stock_df['stock_quantity'].sum()
                 next_demand = self.get_expected_demand(shop, item, day + 1)
                 
-                # 安全在庫係数 (これより多くないと送らない = 実用的なバッファ)
                 safety_stock = next_demand * 0.2 
                 balance = current_qty - (next_demand + safety_stock)
                 
@@ -296,8 +290,6 @@ class RealWorldSupplySimulation:
                     if sender['qty'] <= 0 or receiver['qty'] <= 0: continue
                     
                     amount = min(sender['qty'], receiver['qty'])
-                    
-                    # ★閾値制御 (LPには無い、実用的な制約)
                     if amount < self.transport_threshold: continue
                     
                     transferred_count += amount
@@ -341,14 +333,13 @@ class RealWorldSupplySimulation:
         self.daily_transport_cost = 0
         self.daily_disposal_cost = 0
         
-        # 1. 入荷
         self.inbound_process(day)
         
-        # 2. 販売
         sold_today = 0
         demand_rows = []
         for shop in self.shops:
             for item in self.items:
+                # ★ここでも価格弾力性が効いた需要を使用
                 expected = self.get_expected_demand(shop, item, day)
                 qty = max(0, int(self.rng.normal(expected, 4 * self.demand_std_scale)))
                 if qty > 0:
@@ -376,10 +367,8 @@ class RealWorldSupplySimulation:
                 
                 self.daily_sales_amount += sell * self.item_props[item]['price']
 
-        # 3. 転送 (戦略に応じて実行)
         transferred = self.run_transshipment(day)
 
-        # 4. 廃棄
         expired = self.current_stock['remaining_shelf_life'] <= 0
         waste_count_today = 0
         
@@ -410,24 +399,24 @@ class RealWorldSupplySimulation:
 def main():
     st.title("食品サプライチェーン経営シミュレーター")
     st.markdown("""
-    4つの戦略を比較検証します：
-    1. **Random**: 発注が不正確、転送なし
-    2. **FIFO**: 発注は正確(発注点方式)、転送なし [基準]
-    3. **LP**: 発注は正確、**数理最適化**による理想的な転送
-    4. **New Optimization**: 発注は正確、**提案手法(閾値+予測)**による現実的な転送
+    4つの戦略(Random, FIFO, LP, New Optimization)を比較検証します。
+    **「価格弾力性」** により、販売単価を変更すると需要が変動するリアルな市場原理を導入済みです。
     """)
 
     st.sidebar.header("経営パラメータ設定")
     
     with st.sidebar.expander("① 商品・店舗マスタ設定", expanded=True):
-        st.caption("発注基準＝目標在庫レベル")
+        st.caption("「基準価格」より高く売ると需要が減り、安く売ると増えます。")
         
+        # ★基準価格と価格弾力性を追加
         default_items_data = {
             '商品名': ['トマト', '牛乳', 'パン'],
             '賞味期限(日)': [5, 7, 4],
             '基本需要(個)': [8, 6, 8],
             '発注基準(個)': [20, 15, 20],
-            '販売単価(円)': [120, 200, 150],
+            '販売単価(円)': [120, 200, 150],  # 現在の設定価格
+            '基準価格(円)': [120, 200, 150],  # 需要計算の基準となる価格
+            '価格弾力性': [1.5, 0.8, 1.2],    # 1.0より大きいと価格に敏感
             '仕入れ原価(円)': [60, 140, 70],
             '廃棄コスト(円)': [10, 20, 5]
         }
@@ -439,8 +428,10 @@ def main():
             key="editor_items",
             column_config={
                 "販売単価(円)": st.column_config.NumberColumn(format="¥%d"),
+                "基準価格(円)": st.column_config.NumberColumn(format="¥%d"),
                 "仕入れ原価(円)": st.column_config.NumberColumn(format="¥%d"),
                 "廃棄コスト(円)": st.column_config.NumberColumn(format="¥%d"),
+                "価格弾力性": st.column_config.NumberColumn(help="1.0:標準, >1:敏感, <1:鈍感")
             }
         )
 
@@ -467,7 +458,6 @@ def main():
             st.error("設定が必要です。")
             return
 
-        # 4つの戦略を定義
         strategies = ['Random', 'FIFO', 'LP', 'New Optimization']
         colors = {'Random': 'gray', 'FIFO': 'blue', 'LP': 'orange', 'New Optimization': 'red'}
         
@@ -513,7 +503,6 @@ def main():
         # --- 結果表示 ---
         st.subheader("📊 戦略別 損益比較")
         
-        # データフレーム作成
         summary_data = []
         for s in strategies:
             r = results[s]
@@ -534,20 +523,18 @@ def main():
         plt.subplots_adjust(hspace=0.3)
 
         for s in strategies:
-            # Randomはばらつきが大きいので少し薄くする
             alpha = 0.5 if s == 'Random' else 1.0
             width = 2.5 if s == 'New Optimization' else 1.5
-            
             ax1.plot(results[s]["CumProfit"], label=s, color=colors[s], alpha=alpha, linewidth=width)
             ax2.plot(results[s]["DailyWaste"], label=s, color=colors[s], alpha=alpha, linewidth=width)
 
-        ax1.set_title("累積利益の推移")
+        ax1.set_title("累積利益の推移 (高いほど良い)")
         ax1.set_ylabel("利益 (円)")
         ax1.set_xlabel("経過日数")
         ax1.grid(True, linestyle='--', alpha=0.6)
         ax1.legend()
         
-        ax2.set_title("日次廃棄数の推移")
+        ax2.set_title("日次廃棄数の推移 (低いほど良い)")
         ax2.set_ylabel("廃棄数 (個)")
         ax2.set_xlabel("経過日数")
         ax2.grid(True, linestyle='--', alpha=0.6)
@@ -555,12 +542,11 @@ def main():
 
         st.pyplot(fig)
         
-        # 考察コメント
         best_profit = max(results, key=lambda x: results[x]['Profit'])
         st.info(f"""
         **分析結果:** 最も利益が高かった戦略は **{best_profit}** です。
-        LPは理論上の最適解を出しますが、輸送コストや閾値を考慮する New Optimization も、
-        現実的な制約の中で高いパフォーマンスを発揮できているか確認してください。
+        表の「販売単価」を「基準価格」より高く設定して試してみてください。
+        弾力性が高い商品は需要が減り、利益が悪化する様子が確認できます。
         """)
 
 if __name__ == "__main__":
