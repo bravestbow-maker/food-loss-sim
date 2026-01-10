@@ -457,7 +457,8 @@ def main():
         )
 
     with st.sidebar.expander("② シミュレーション条件", expanded=False):
-        days = st.slider("期間 (日)", 10, 60, 30)
+        # ★ここを変更: 60 -> 365
+        days = st.slider("期間 (日)", 10, 365, 30)
         demand_std = st.slider("需要のばらつき倍率", 0.0, 2.0, 1.0)
         threshold = st.slider("転送閾値 (New Model用)", 1, 10, 5)
         cost_unit = st.number_input("1個あたりの輸送コスト (円)", value=30)
