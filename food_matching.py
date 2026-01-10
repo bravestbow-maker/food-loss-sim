@@ -22,36 +22,38 @@ setup_japanese_font()
 # ---------------------------------------------------------
 # 2. アプリ設定
 # ---------------------------------------------------------
-st.set_page_config(layout="wide", page_title="食品サプライチェーン動的シミュレーター")
+st.set_page_config(layout="wide", page_title="食品サプライチェーン経営シミュレーター")
 
 # ---------------------------------------------------------
-# 3. シミュレーションモデル (設定受取対応版)
+# 3. シミュレーションモデル (完全経済性評価版)
 # ---------------------------------------------------------
 class RealWorldSupplySimulation:
     def __init__(self, 
-                 shop_config_df,     # ★変更: 店舗設定DFを受け取る
-                 item_config_df,     # ★変更: 商品設定DFを受け取る
+                 shop_config_df,     
+                 item_config_df,     
                  random_seed=42, 
                  demand_std_scale=1.0, 
-                 supply_mean=35,
                  enable_transshipment=False, 
                  transport_threshold=5,
                  transport_cost_unit=10):
         
         self.rng = np.random.default_rng(random_seed)
         
-        # 設定データフレームから情報を抽出
         # 1. 店舗情報
         self.shops = shop_config_df['店舗名'].tolist()
         self.shop_scales = dict(zip(shop_config_df['店舗名'], shop_config_df['規模倍率']))
 
-        # 2. 商品情報
+        # 2. 商品情報 (経済パラメータを含む詳細情報)
         self.items = item_config_df['商品名'].tolist()
         self.item_props = {}
         for _, row in item_config_df.iterrows():
             self.item_props[row['商品名']] = {
                 'life': int(row['賞味期限(日)']),
-                'base': int(row['基本需要(個)'])
+                'base_demand': int(row['基本需要(個)']),
+                'base_supply': int(row['発注基準(個)']), # ★商品ごとの発注量
+                'price': int(row['販売単価(円)']),      # ★売上計算用
+                'cost': int(row['仕入れ原価(円)']),     # ★原価計算用
+                'disposal': int(row['廃棄コスト(円)'])  # ★廃棄損計算用
             }
 
         # 在庫データ
@@ -60,14 +62,16 @@ class RealWorldSupplySimulation:
         ])
         self.next_stock_id = 1
         
-        # KPI
-        self.total_waste_count = 0
-        self.total_sales_count = 0
-        self.total_transport_cost = 0 
+        # ★KPI (金額ベース)
+        self.total_sales_amount = 0     # 売上高
+        self.total_procurement_cost = 0 # 仕入れコスト
+        self.total_disposal_cost = 0    # 廃棄コスト
+        self.total_transport_cost = 0   # 輸送コスト
+        
+        self.total_waste_count = 0 # (参考)廃棄個数
         
         self.WEEKLY_DEMAND_PATTERN = [1.0, 0.9, 0.9, 1.0, 1.2, 1.4, 1.3]
         self.demand_std_scale = demand_std_scale
-        self.supply_mean = supply_mean
         
         self.enable_transshipment = enable_transshipment
         self.transport_threshold = transport_threshold
@@ -76,10 +80,8 @@ class RealWorldSupplySimulation:
     def get_expected_demand(self, shop, item, day):
         weekday = (day - 1) % 7
         factor = self.WEEKLY_DEMAND_PATTERN[weekday]
-        
         scale = self.shop_scales[shop]
-        base = self.item_props[item]['base']
-        
+        base = self.item_props[item]['base_demand']
         return base * scale * factor
 
     def inbound_process(self, day):
@@ -88,13 +90,21 @@ class RealWorldSupplySimulation:
         new_rows = []
         for shop in self.shops:
             for item in self.items:
-                expected = self.get_expected_demand(shop, item, day)
-                order_qty = max(0, int(self.rng.normal(expected * (self.supply_mean/30), 5)))
+                # 商品ごとの「発注基準量」をベースに入荷数を決定
+                # (需要予測ベースではなく、発注点管理に近いイメージ)
+                base_supply = self.item_props[item]['base_supply']
+                scale = self.shop_scales[shop]
+                
+                # 店舗規模に合わせて発注量もスケーリング
+                target_qty = base_supply * scale
+                
+                # 日々のゆらぎ
+                order_qty = max(0, int(self.rng.normal(target_qty, target_qty * 0.1)))
                 
                 if order_qty > 0:
-                    full_life = self.item_props[item]['life']
+                    props = self.item_props[item]
                     delay = int(self.rng.exponential(1.0))
-                    life = max(1, full_life - delay)
+                    life = max(1, props['life'] - delay)
                     
                     new_rows.append({
                         'stock_id': self.next_stock_id,
@@ -104,6 +114,9 @@ class RealWorldSupplySimulation:
                         'remaining_shelf_life': life
                     })
                     self.next_stock_id += 1
+                    
+                    # ★仕入れコスト加算
+                    self.total_procurement_cost += order_qty * props['cost']
         
         if new_rows:
             self.current_stock = pd.concat([self.current_stock, pd.DataFrame(new_rows)], ignore_index=True)
@@ -213,13 +226,27 @@ class RealWorldSupplySimulation:
                 self.current_stock.at[idx, 'stock_quantity'] -= sell
                 sold_today += sell
                 need -= sell
+                
+                # ★売上加算
+                self.total_sales_amount += sell * self.item_props[item]['price']
 
-        self.total_sales_count += sold_today
         transferred = self.run_transshipment(day)
 
+        # 廃棄計算
         expired = self.current_stock['remaining_shelf_life'] <= 0
-        waste_today = self.current_stock.loc[expired, 'stock_quantity'].sum()
-        self.total_waste_count += waste_today
+        # 商品ごとに廃棄コストが違うためループ計算
+        waste_cost_today = 0
+        waste_count_today = 0
+        
+        expired_rows = self.current_stock[expired]
+        for _, row in expired_rows.iterrows():
+            qty = row['stock_quantity']
+            item = row['item']
+            waste_count_today += qty
+            waste_cost_today += qty * self.item_props[item]['disposal']
+            
+        self.total_waste_count += waste_count_today
+        self.total_disposal_cost += waste_cost_today
         
         self.current_stock = self.current_stock[
             (self.current_stock['stock_quantity'] > 0) & 
@@ -227,63 +254,69 @@ class RealWorldSupplySimulation:
         ]
         self.current_stock['remaining_shelf_life'] -= 1
         
-        return waste_today, transferred
+        return waste_count_today, transferred
 
 # ---------------------------------------------------------
 # 4. メインUI
 # ---------------------------------------------------------
 def main():
-    st.title("動的サプライチェーンシミュレーション (詳細設定版)")
-    st.markdown("店舗リストや商品スペック（賞味期限・需要）を自由に変更してシミュレーションできます。")
+    st.title("食品サプライチェーン経営シミュレーター")
+    st.markdown("""
+    商品ごとの原価・売価・廃棄コストまで設定できる本格的な経営シミュレーション。
+    在庫転送による「個数の削減」だけでなく、「最終利益」への影響を検証します。
+    """)
 
-    st.sidebar.header("条件設定")
+    st.sidebar.header("経営パラメータ設定")
     
-    # --- ネットワーク構成 (編集可能テーブル) ---
-    with st.sidebar.expander("① ネットワーク詳細設定", expanded=True):
-        st.caption("下表を直接編集して、店舗や商品を追加・変更できます。")
+    # --- 編集可能テーブル ---
+    with st.sidebar.expander("① 商品・店舗マスタ設定", expanded=True):
+        st.caption("各商品の原価や売価を細かく設定してください。")
         
-        # 1. 店舗設定データの作成
+        # 1. 商品設定（経済パラメータ追加）
+        default_items_data = {
+            '商品名': ['トマト', '牛乳', 'パン'],
+            '賞味期限(日)': [5, 7, 4],
+            '基本需要(個)': [8, 6, 8],
+            '発注基準(個)': [30, 25, 35],      # ★New
+            '販売単価(円)': [120, 200, 150],  # ★New
+            '仕入れ原価(円)': [60, 140, 70],  # ★New
+            '廃棄コスト(円)': [10, 20, 5]     # ★New
+        }
+        df_items_default = pd.DataFrame(default_items_data)
+        
+        edited_items_df = st.data_editor(
+            df_items_default, 
+            num_rows="dynamic", 
+            key="editor_items",
+            column_config={
+                "販売単価(円)": st.column_config.NumberColumn(format="¥%d"),
+                "仕入れ原価(円)": st.column_config.NumberColumn(format="¥%d"),
+                "廃棄コスト(円)": st.column_config.NumberColumn(format="¥%d"),
+            }
+        )
+
+        # 2. 店舗設定
         default_shops_data = {
             '店舗名': ['大学会館店', 'つくば駅前店', 'ひたち野牛久店', '研究学園店'],
             '規模倍率': [1.5, 1.0, 0.6, 0.8]
         }
         df_shops_default = pd.DataFrame(default_shops_data)
         
-        st.markdown("**店舗設定**")
         edited_shops_df = st.data_editor(
             df_shops_default, 
-            num_rows="dynamic", # 行の追加削除を許可
+            num_rows="dynamic",
             key="editor_shops"
         )
-        
-        # 2. 商品設定データの作成
-        default_items_data = {
-            '商品名': ['トマト', '牛乳', 'パン', 'おにぎり', '弁当'],
-            '賞味期限(日)': [5, 7, 4, 1, 1],
-            '基本需要(個)': [8, 6, 8, 20, 15]
-        }
-        df_items_default = pd.DataFrame(default_items_data)
-        
-        st.markdown("**商品設定**")
-        edited_items_df = st.data_editor(
-            df_items_default, 
-            num_rows="dynamic", # 行の追加削除を許可
-            key="editor_items"
-        )
 
-    with st.sidebar.expander("② 基本設定", expanded=False):
-        days = st.slider("シミュレーション期間 (日)", 10, 60, 30)
-        supply_mean = st.slider("基本入荷基準値", 20, 50, 30)
+    with st.sidebar.expander("② シミュレーション条件", expanded=False):
+        days = st.slider("期間 (日)", 10, 60, 30)
         demand_std = st.slider("需要のばらつき倍率", 0.0, 2.0, 1.0)
-    
-    with st.sidebar.expander("③ 転送・コスト設定", expanded=False):
-        threshold = st.slider("転送閾値 (これ以下は送らない)", 1, 10, 5)
+        threshold = st.slider("転送閾値 (個)", 1, 10, 5)
         cost_unit = st.number_input("1個あたりの輸送コスト (円)", value=30)
 
-    if st.sidebar.button("検証開始", type="primary"):
-        # 入力チェック
+    if st.sidebar.button("経営分析を開始", type="primary"):
         if edited_shops_df.empty or edited_items_df.empty:
-            st.error("店舗と商品は少なくとも1つ以上設定してください。")
+            st.error("店舗と商品は設定が必要です。")
             return
 
         scenarios = [("従来モデル", False), ("提案モデル", True)]
@@ -292,9 +325,8 @@ def main():
         
         for i, (name, enable) in enumerate(scenarios):
             sim = RealWorldSupplySimulation(
-                shop_config_df=edited_shops_df, # ★テーブルデータを渡す
-                item_config_df=edited_items_df, # ★テーブルデータを渡す
-                supply_mean=supply_mean,
+                shop_config_df=edited_shops_df,
+                item_config_df=edited_items_df,
                 demand_std_scale=demand_std,
                 enable_transshipment=enable,
                 transport_threshold=threshold,
@@ -305,9 +337,16 @@ def main():
                 w, _ = sim.step(d)
                 daily_waste.append(w)
             
+            # 最終利益の計算
+            gross_profit = sim.total_sales_amount - sim.total_procurement_cost
+            final_profit = gross_profit - sim.total_disposal_cost - sim.total_transport_cost
+            
             results.append({
                 "Name": name,
-                "Waste": sim.total_waste_count,
+                "Profit": final_profit,
+                "Sales": sim.total_sales_amount,
+                "WasteCount": sim.total_waste_count,
+                "WasteCost": sim.total_disposal_cost,
                 "TransportCost": sim.total_transport_cost,
                 "DailyWaste": daily_waste
             })
@@ -318,23 +357,38 @@ def main():
         base = results[0]
         prop = results[1]
         
-        waste_diff = base["Waste"] - prop["Waste"]
-        rate = (waste_diff / base["Waste"] * 100) if base["Waste"] > 0 else 0
+        profit_diff = prop["Profit"] - base["Profit"]
         
-        WASTE_COST = 100
-        cost_saving = (waste_diff * WASTE_COST) - prop["TransportCost"]
-
+        # --- 結果表示 (PL形式) ---
+        st.subheader("💰 損益計算書 (P/L) 比較")
+        
         col1, col2, col3 = st.columns(3)
-        col1.metric("廃棄削減数", f"▲{int(waste_diff)}個", f"{rate:.1f}% 削減")
-        col2.metric("輸送コスト", f"{int(prop['TransportCost']):,} 円", f"商品数:{len(edited_items_df)}")
-        col3.metric("経済効果", f"{int(cost_saving):,} 円", "廃棄削減 - 輸送費")
+        col1.metric("① 従来モデル 最終利益", f"¥{int(base['Profit']):,}")
+        col2.metric("② 提案モデル 最終利益", f"¥{int(prop['Profit']):,}")
+        
+        delta_color = "normal" if profit_diff > 0 else "inverse"
+        col3.metric("利益改善額 (②-①)", f"¥{int(profit_diff):,}", delta_color=delta_color)
 
-        st.subheader("日次廃棄量の推移")
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(base["DailyWaste"], label="従来モデル", linestyle='--', color='gray')
-        ax.plot(prop["DailyWaste"], label="提案モデル", color='red', linewidth=2)
-        ax.legend()
-        st.pyplot(fig)
+        # 詳細テーブル
+        st.markdown("##### 詳細内訳")
+        detail_data = {
+            "項目": ["売上高", "仕入原価", "廃棄コスト", "輸送コスト", "【最終利益】", "(参考)廃棄個数"],
+            "従来モデル": [
+                f"¥{base['Sales']:,}", f"¥-{int(base['Sales'] - base['Profit'] - base['WasteCost']):,}", # 原価逆算表示
+                f"¥-{base['WasteCost']:,}", "¥0", f"**¥{base['Profit']:,}**", f"{base['WasteCount']}個"
+            ],
+            "提案モデル": [
+                f"¥{prop['Sales']:,}", f"¥-{int(prop['Sales'] - prop['Profit'] - prop['WasteCost'] - prop['TransportCost']):,}",
+                f"¥-{prop['WasteCost']:,}", f"¥-{prop['TransportCost']:,}", f"**¥{prop['Profit']:,}**", f"{prop['WasteCount']}個"
+            ]
+        }
+        st.table(pd.DataFrame(detail_data))
+
+        # 考察
+        if profit_diff > 0:
+            st.success(f"**分析:** 輸送コスト(¥{prop['TransportCost']:,})をかけましたが、廃棄コストの大幅削減(¥{base['WasteCost']-prop['WasteCost']:,})により、最終的に利益が増加しました。")
+        else:
+            st.warning(f"**分析:** 利益が減少しています。輸送コスト(¥{prop['TransportCost']:,})が高すぎて、廃棄削減によるメリットを食いつぶしています。")
 
 if __name__ == "__main__":
     main()
