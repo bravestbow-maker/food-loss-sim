@@ -54,8 +54,8 @@ class RealWorldSupplySimulation:
                 'base_demand': int(row['基本需要(個)']),
                 'target_stock': int(row['発注基準(個)']),
                 'price': int(row['販売単価(円)']),
-                'base_price': int(row['基準価格(円)']),    # ★追加: 需要の基準となる価格
-                'elasticity': float(row['価格弾力性']),    # ★追加: 感度
+                'base_price': int(row['基準価格(円)']),    # 基準価格
+                'elasticity': float(row['価格弾力性']),    # 価格弾力性
                 'cost': int(row['仕入れ原価(円)']),
                 'disposal': int(row['廃棄コスト(円)'])
             }
@@ -86,7 +86,7 @@ class RealWorldSupplySimulation:
         self.transport_threshold = transport_threshold
         self.transport_cost_unit = transport_cost_unit
 
-    # ★修正: 価格弾力性を考慮した需要計算
+    # 価格弾力性を考慮した需要計算
     def get_expected_demand(self, shop, item, day):
         weekday = (day - 1) % 7
         factor = self.WEEKLY_DEMAND_PATTERN[weekday]
@@ -96,16 +96,13 @@ class RealWorldSupplySimulation:
         base_demand = self.item_props[item]['base_demand']
         
         # 2. 価格弾力性による補正
-        # 需要 = 基本需要 * (設定価格 / 基準価格) ^ (-弾力性)
         current_price = self.item_props[item]['price']
         base_price = self.item_props[item]['base_price']
         elasticity = self.item_props[item]['elasticity']
         
-        # ゼロ除算回避
         if base_price <= 0: base_price = 1
         
         price_ratio = current_price / base_price
-        # 弾力性が反映された需要倍率
         price_factor = price_ratio ** (-elasticity)
         
         return base_demand * scale * factor * price_factor
@@ -119,20 +116,17 @@ class RealWorldSupplySimulation:
         new_rows = []
         for shop in self.shops:
             for item in self.items:
-                # --- 追加計算: 現在の価格設定に基づく需要倍率を取得 ---
+                # 需要予測に基づく発注量の調整
                 current_price = self.item_props[item]['price']
                 base_price = self.item_props[item]['base_price']
                 elasticity = self.item_props[item]['elasticity']
                 if base_price <= 0: base_price = 1
                 price_ratio = current_price / base_price
                 price_factor = price_ratio ** (-elasticity)
-                # ---------------------------------------------------
 
-                # 発注基準にも価格による需要変動(price_factor)を掛ける
                 base_target = self.item_props[item]['target_stock']
                 scale = self.shop_scales[shop]
                 
-                # ★ ここを変更: price_factor を掛ける
                 target_level = base_target * scale * price_factor
                 
                 if self.strategy == 'Random':
@@ -265,17 +259,13 @@ class RealWorldSupplySimulation:
         self.current_stock.reset_index(drop=True, inplace=True)
 
         for item in self.items:
-            # --- ★ 追加: コスト対効果の判定 ---
-            # 輸送費が (売価 + 廃棄回避コスト) を上回るなら、転送しない方がマシ（赤字になる）
+            # --- ★ コスト対効果の判定 ---
             unit_price = self.item_props[item]['price']
             disposal_cost = self.item_props[item]['disposal']
-            
-            # 転送による経済的価値 = 売上の確保 + 廃棄コストの回避
             economic_value = unit_price + disposal_cost
             
             if self.transport_cost_unit > economic_value:
                 continue # 輸送費が高すぎて割に合わないためスキップ
-            # ------------------------------------
 
             senders = []
             receivers = []
@@ -360,7 +350,6 @@ class RealWorldSupplySimulation:
         demand_rows = []
         for shop in self.shops:
             for item in self.items:
-                # ★ここでも価格弾力性が効いた需要を使用
                 expected = self.get_expected_demand(shop, item, day)
                 qty = max(0, int(self.rng.normal(expected, 4 * self.demand_std_scale)))
                 if qty > 0:
@@ -419,9 +408,42 @@ class RealWorldSupplySimulation:
 # ---------------------------------------------------------
 def main():
     st.title("食品サプライチェーン経営シミュレーター")
+    
+    # --- 解説パネルの追加 ---
+    with st.expander("📖 シミュレーションの仕組みと戦略の解説"):
+        st.markdown("""
+        ### 1. 経済モデル：価格弾力性
+        商品は価格によって需要が変動します。「基準価格」より高く売ると需要は減少し、安く売ると増加します。
+        
+        **需要計算式:** $$需要 = 基本需要 \\times \\left( \\frac{販売単価}{基準価格} \\right)^{-\\text{価格弾力性}}$$
+        
+        ---
+        ### 2. 戦略の違い
+        このシミュレーションでは4つの在庫管理戦略を比較します。
+        
+        1.  **Random (ランダム発注)**
+            * 発注量が適当（基準値の±50%）です。
+            * 店舗間の在庫転送は行いません。
+            * **特徴:** 欠品と廃棄が同時に大量発生する「悪い経営」の例です。
+
+        2.  **FIFO (先入先出・発注点方式)**
+            * 毎朝、減った在庫分をきっちり発注して補充します。
+            * 店舗間の在庫転送は行いません。
+            * **特徴:** 基本的な管理手法ですが、需要の急変動には弱く、店ごとの過不足を解消できません。
+
+        3.  **LP (線形計画法・最適化)**
+            * 数理最適化ソルバー(`PuLP`)を使用します。
+            * 全店舗の在庫状況を見て、「利益が最大（輸送コストも考慮）」になるように最適な在庫転送ルートを計算します。
+            * **特徴:** 理論上の「最強の経営」ですが、計算コストがかかります。
+
+        4.  **New Optimization (ヒューリスティック・独自戦略)**
+            * 「余っている店」から「足りない店」へ、ルールベースで融通（転送）します。
+            * **重要:** 「輸送コスト」が「商品の利益＋廃棄回避額」を上回る場合は、転送せずに廃棄を選択する賢いコスト判定を行います。
+            * **特徴:** 高速な計算で、LPに近い利益を出そうとする実用的な戦略です。
+        """)
+
     st.markdown("""
-    4つの戦略(Random, FIFO, LP, New Optimization)を比較検証します。
-    **「価格弾力性」** により、販売単価を変更すると需要が変動するリアルな市場原理を導入済みです。
+    左側のサイドバーでパラメータを調整し、「4戦略比較を実行」ボタンを押してください。
     """)
 
     st.sidebar.header("経営パラメータ設定")
@@ -429,15 +451,14 @@ def main():
     with st.sidebar.expander("① 商品・店舗マスタ設定", expanded=True):
         st.caption("「基準価格」より高く売ると需要が減り、安く売ると増えます。")
         
-        # ★基準価格と価格弾力性を追加
         default_items_data = {
             '商品名': ['トマト', '牛乳', 'パン'],
             '賞味期限(日)': [5, 7, 4],
             '基本需要(個)': [8, 6, 8],
             '発注基準(個)': [20, 15, 20],
-            '販売単価(円)': [120, 200, 150],  # 現在の設定価格
-            '基準価格(円)': [120, 200, 150],  # 需要計算の基準となる価格
-            '価格弾力性': [1.5, 0.8, 1.2],    # 1.0より大きいと価格に敏感
+            '販売単価(円)': [120, 200, 150],
+            '基準価格(円)': [120, 200, 150],
+            '価格弾力性': [1.5, 0.8, 1.2],
             '仕入れ原価(円)': [60, 140, 70],
             '廃棄コスト(円)': [10, 20, 5]
         }
@@ -473,8 +494,6 @@ def main():
         demand_std = st.slider("需要のばらつき倍率", 0.0, 2.0, 1.0)
         threshold = st.slider("転送閾値 (New Model用)", 1, 10, 5)
         cost_unit = st.number_input("1個あたりの輸送コスト (円)", value=30)
-        
-        # --- シード値コントロールを追加 ---
         seed_val = st.number_input("乱数シード", value=42, step=1, help="同じ値にすると結果が再現されます")
 
     if st.sidebar.button("4戦略比較を実行", type="primary"):
@@ -489,12 +508,11 @@ def main():
         progress = st.progress(0)
         
         for i, strat in enumerate(strategies):
-            # --- シード値を引数として渡す ---
             sim = RealWorldSupplySimulation(
                 strategy=strat,
                 shop_config_df=edited_shops_df,
                 item_config_df=edited_items_df,
-                random_seed=seed_val,  # ★ここをUIからの値に変更
+                random_seed=seed_val,
                 demand_std_scale=demand_std,
                 transport_threshold=threshold,
                 transport_cost_unit=cost_unit
