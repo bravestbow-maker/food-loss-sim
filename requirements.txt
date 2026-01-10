@@ -3,4 +3,3 @@ pandas
 pulp
 matplotlib
 numpy
-japanize-matplotlib
