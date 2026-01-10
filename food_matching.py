@@ -25,7 +25,7 @@ setup_japanese_font()
 st.set_page_config(layout="wide", page_title="食品サプライチェーン経営シミュレーター")
 
 # ---------------------------------------------------------
-# 3. シミュレーションモデル (グラフ用データ出力強化版)
+# 3. シミュレーションモデル (ロジック修正版)
 # ---------------------------------------------------------
 class RealWorldSupplySimulation:
     def __init__(self, 
@@ -50,7 +50,7 @@ class RealWorldSupplySimulation:
             self.item_props[row['商品名']] = {
                 'life': int(row['賞味期限(日)']),
                 'base_demand': int(row['基本需要(個)']),
-                'base_supply': int(row['発注基準(個)']),
+                'target_stock': int(row['発注基準(個)']), # ★意味変更: 目標在庫レベル
                 'price': int(row['販売単価(円)']),
                 'cost': int(row['仕入れ原価(円)']),
                 'disposal': int(row['廃棄コスト(円)'])
@@ -69,7 +69,7 @@ class RealWorldSupplySimulation:
         self.total_transport_cost = 0
         self.total_waste_count = 0
         
-        # 日次計算用の一時変数
+        # 日次計算用
         self.daily_procurement_cost = 0
         self.daily_sales_amount = 0
         self.daily_transport_cost = 0
@@ -89,16 +89,34 @@ class RealWorldSupplySimulation:
         base = self.item_props[item]['base_demand']
         return base * scale * factor
 
+    # ---------------------------------------------------------
+    # ★ロジック修正: 発注点方式 (Order-Up-To Policy)
+    # 現在の在庫を確認し、目標在庫(target_stock)まで補充する
+    # ---------------------------------------------------------
     def inbound_process(self, day):
-        if (day - 1) % 7 == 6: return 
+        if (day - 1) % 7 == 6: return # 日曜発注なし
 
         new_rows = []
         for shop in self.shops:
             for item in self.items:
-                base_supply = self.item_props[item]['base_supply']
+                # 1. 現在の有効在庫数を確認
+                current_stock_df = self.current_stock[
+                    (self.current_stock['retail_store'] == shop) & 
+                    (self.current_stock['item'] == item)
+                ]
+                current_qty = current_stock_df['stock_quantity'].sum()
+                
+                # 2. 目標在庫レベル (店舗規模に応じて調整)
+                base_target = self.item_props[item]['target_stock']
                 scale = self.shop_scales[shop]
-                target_qty = base_supply * scale
-                order_qty = max(0, int(self.rng.normal(target_qty, target_qty * 0.1)))
+                target_level = base_target * scale
+                
+                # 3. 発注量の計算 (目標 - 現在)
+                # 足りない分だけ発注する。マイナスなら発注しない。
+                needed_qty = target_level - current_qty
+                
+                # 発注量のゆらぎ (オペレーション誤差)
+                order_qty = max(0, int(self.rng.normal(needed_qty, target_level * 0.05)))
                 
                 if order_qty > 0:
                     props = self.item_props[item]
@@ -114,7 +132,7 @@ class RealWorldSupplySimulation:
                     })
                     self.next_stock_id += 1
                     
-                    # 日次コスト加算
+                    # コスト加算
                     cost = order_qty * props['cost']
                     self.daily_procurement_cost += cost
                     self.total_procurement_cost += cost
@@ -127,6 +145,8 @@ class RealWorldSupplySimulation:
         
         transferred_count = 0
         new_transferred_stock = []
+        
+        # インデックスリセット (エラー防止)
         self.current_stock.reset_index(drop=True, inplace=True)
 
         for item in self.items:
@@ -140,20 +160,28 @@ class RealWorldSupplySimulation:
                 ]
                 current_qty = stock_df['stock_quantity'].sum()
                 next_demand = self.get_expected_demand(shop, item, day + 1)
-                balance = current_qty - next_demand
+                
+                # 安全在庫係数 (これより多くないと送らない)
+                safety_stock = next_demand * 0.2 
+                balance = current_qty - (next_demand + safety_stock)
                 
                 if balance > 0:
+                    # 送り手: 賞味期限2日以上のみ
                     valid_stock = stock_df[stock_df['remaining_shelf_life'] >= 2]
                     sendable = valid_stock['stock_quantity'].sum()
-                    surplus = max(0, sendable - next_demand)
+                    surplus = max(0, sendable - (next_demand + safety_stock))
+                    
                     if surplus > 0:
+                        # indexリストを保持
                         senders.append({'shop': shop, 'qty': surplus, 'df_index': valid_stock.index.tolist()})
                         
-                elif balance < 0:
-                    shortage = abs(balance)
+                elif current_qty < next_demand:
+                    # 受け手: 明日の分が足りない
+                    shortage = next_demand - current_qty
                     urgency = shortage / (next_demand + 1)
                     receivers.append({'shop': shop, 'qty': shortage, 'urgency': urgency})
 
+            # マッチング
             receivers.sort(key=lambda x: x['urgency'], reverse=True)
             senders.sort(key=lambda x: x['qty'], reverse=True)
             
@@ -168,21 +196,26 @@ class RealWorldSupplySimulation:
                     sender['qty'] -= amount
                     receiver['qty'] -= amount
                     
-                    # 輸送コスト加算
                     t_cost = amount * self.transport_cost_unit
                     self.daily_transport_cost += t_cost
                     self.total_transport_cost += t_cost
                     
                     remaining = amount
+                    # 送り手の在庫を減らす
                     for idx in sender['df_index']:
                         if remaining <= 0: break
+                        
+                        # current_stockから現在の値を取得
+                        if idx not in self.current_stock.index: continue
                         have = self.current_stock.at[idx, 'stock_quantity']
+                        
                         if have <= 0: continue
 
                         take = min(have, remaining)
                         self.current_stock.at[idx, 'stock_quantity'] -= take
                         remaining -= take
                         
+                        # 新しい行を作成 (受け手用)
                         original_row = self.current_stock.loc[idx]
                         new_row = {
                             'stock_id': self.next_stock_id,
@@ -200,14 +233,15 @@ class RealWorldSupplySimulation:
         return transferred_count
 
     def step(self, day):
-        # 日次カウンタのリセット
         self.daily_procurement_cost = 0
         self.daily_sales_amount = 0
         self.daily_transport_cost = 0
         self.daily_disposal_cost = 0
         
+        # 1. 入荷 (修正済み: 足りない分だけ発注)
         self.inbound_process(day)
         
+        # 2. 販売
         sold_today = 0
         demand_rows = []
         for shop in self.shops:
@@ -238,14 +272,12 @@ class RealWorldSupplySimulation:
                 sold_today += sell
                 need -= sell
                 
-                # 売上加算
-                sales = sell * self.item_props[item]['price']
-                self.daily_sales_amount += sales
-                self.total_sales_amount += sales
+                self.daily_sales_amount += sell * self.item_props[item]['price']
 
+        # 3. 転送
         transferred = self.run_transshipment(day)
 
-        # 廃棄計算
+        # 4. 廃棄
         expired = self.current_stock['remaining_shelf_life'] <= 0
         waste_count_today = 0
         
@@ -255,12 +287,10 @@ class RealWorldSupplySimulation:
             item = row['item']
             waste_count_today += qty
             
-            # 廃棄コスト加算
-            d_cost = qty * self.item_props[item]['disposal']
-            self.daily_disposal_cost += d_cost
-            self.total_disposal_cost += d_cost
+            self.daily_disposal_cost += qty * self.item_props[item]['disposal']
             
         self.total_waste_count += waste_count_today
+        self.total_disposal_cost += self.daily_disposal_cost
         
         self.current_stock = self.current_stock[
             (self.current_stock['stock_quantity'] > 0) & 
@@ -268,7 +298,6 @@ class RealWorldSupplySimulation:
         ]
         self.current_stock['remaining_shelf_life'] -= 1
         
-        # 本日の営業利益 (売上 - 仕入 - 廃棄 - 輸送)
         daily_profit = self.daily_sales_amount - self.daily_procurement_cost - self.daily_disposal_cost - self.daily_transport_cost
         
         return waste_count_today, daily_profit
@@ -278,18 +307,22 @@ class RealWorldSupplySimulation:
 # ---------------------------------------------------------
 def main():
     st.title("食品サプライチェーン経営シミュレーター")
-    st.markdown("商品・店舗の設定から、損益計算書(PL)、そして時系列推移グラフまでを一元管理できる統合モデル。")
+    st.markdown("""
+    **修正版ロジック搭載**: 「発注点方式」により、売れた分だけ補充するリアルな在庫管理を実現。
+    在庫の垂れ流しを防いだ上で、転送による最適化効果を検証します。
+    """)
 
     st.sidebar.header("経営パラメータ設定")
     
     with st.sidebar.expander("① 商品・店舗マスタ設定", expanded=True):
-        st.caption("各商品の原価や売価を細かく設定してください。")
+        st.caption("「発注基準」は**目標在庫レベル(Order-Up-To Level)**として機能します。")
         
+        # 発注基準を少し大きめに修正(在庫バッファを持たせるため)
         default_items_data = {
             '商品名': ['トマト', '牛乳', 'パン'],
             '賞味期限(日)': [5, 7, 4],
             '基本需要(個)': [8, 6, 8],
-            '発注基準(個)': [30, 25, 35],
+            '発注基準(個)': [20, 15, 20],      # 目標在庫数 (1日あたりの需要の2~3倍程度が目安)
             '販売単価(円)': [120, 200, 150],
             '仕入れ原価(円)': [60, 140, 70],
             '廃棄コスト(円)': [10, 20, 5]
@@ -345,15 +378,12 @@ def main():
             )
             
             daily_waste = []
-            daily_profit = []
             cumulative_profit = []
             current_cum_profit = 0
             
             for d in range(1, days + 1):
                 w, p = sim.step(d)
                 daily_waste.append(w)
-                daily_profit.append(p)
-                
                 current_cum_profit += p
                 cumulative_profit.append(current_cum_profit)
             
@@ -379,7 +409,7 @@ def main():
         prop = results[1]
         profit_diff = prop["Profit"] - base["Profit"]
         
-        # --- 損益計算書 (P/L) ---
+        # --- P/L ---
         st.subheader("💰 損益計算書 (P/L) 比較")
         
         col1, col2, col3 = st.columns(3)
@@ -401,37 +431,29 @@ def main():
         }
         st.table(pd.DataFrame(detail_data))
 
-        # --- グラフ表示 (ここを復活・強化) ---
+        # --- Graph ---
         st.subheader("📈 シミュレーション推移")
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
         plt.subplots_adjust(hspace=0.3)
 
-        # グラフ1: 累積利益の推移
         ax1.plot(base["CumProfit"], label="従来モデル", linestyle='--', color='gray')
         ax1.plot(prop["CumProfit"], label="提案モデル", color='green', linewidth=2)
-        ax1.set_title("累積利益の推移 (高いほど良い)")
+        ax1.set_title("累積利益の推移 (在庫適正化済み)")
         ax1.set_ylabel("利益 (円)")
         ax1.set_xlabel("経過日数")
         ax1.grid(True, linestyle='--', alpha=0.6)
         ax1.legend()
         
-        # グラフ2: 日次廃棄数の推移
         ax2.plot(base["DailyWaste"], label="従来モデル", linestyle='--', color='gray')
         ax2.plot(prop["DailyWaste"], label="提案モデル", color='red', linewidth=2)
-        ax2.set_title("日次廃棄数の推移 (低いほど良い)")
+        ax2.set_title("日次廃棄数の推移")
         ax2.set_ylabel("廃棄数 (個)")
         ax2.set_xlabel("経過日数")
         ax2.grid(True, linestyle='--', alpha=0.6)
         ax2.legend()
 
         st.pyplot(fig)
-
-        # 考察
-        if profit_diff > 0:
-            st.success(f"**分析:** 利益グラフ(緑)が上回っており、転送コストを吸収して黒字化に成功しています。")
-        else:
-            st.warning(f"**分析:** 利益グラフ(緑)が下回っています。輸送コストが負担になっています。")
 
 if __name__ == "__main__":
     main()
