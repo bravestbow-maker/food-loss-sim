@@ -564,7 +564,7 @@ def main():
         progress.empty()
         
         # --- 結果表示 (Summary Table) ---
-        st.subheader("📊 戦略別 損益・KPI比較")
+        st.subheader(" 戦略別 損益・KPI比較")
         
         summary_data = []
         for s in strategies:
@@ -581,13 +581,13 @@ def main():
         
         # --- 比較モデル詳細検討 (Advanced Analysis) ---
         st.markdown("---")
-        st.subheader("🔍 比較モデルの検討（詳細分析）")
+        st.subheader(" 比較モデルの検討（詳細分析）")
         
         col_analysis_1, col_analysis_2 = st.columns(2)
         
         # 1. コスト構造分析 (Stacked Bar Chart)
         with col_analysis_1:
-            st.markdown("##### 💰 コスト構造の比較")
+            st.markdown("##### コスト構造の比較")
             st.caption("利益を生むためには、廃棄と輸送のバランスが重要です。")
             
             fig_cost, ax_cost = plt.subplots(figsize=(6, 4))
@@ -618,7 +618,7 @@ def main():
 
         # 2. 利益の安定性分析 (Box Plot)
         with col_analysis_2:
-            st.markdown("##### 📉 利益の安定性 (リスク分析)")
+            st.markdown("##### 利益の安定性 (リスク分析)")
             st.caption("日々の利益のばらつき（箱ひげ図）。箱が小さく高い位置にあるのが理想です。")
             
             fig_risk, ax_risk = plt.subplots(figsize=(6, 4))
@@ -635,7 +635,7 @@ def main():
 
         # --- 基本グラフ (Trend) ---
         st.markdown("---")
-        st.subheader("📈 シミュレーション推移")
+        st.subheader("シミュレーション推移")
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
         plt.subplots_adjust(hspace=0.3)
