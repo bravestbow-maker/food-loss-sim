@@ -387,7 +387,11 @@ class RealWorldSupplySimulation:
                 
                 need -= sell
                 
-                self.daily_sales_amount += sell * self.item_props[item]['price']
+                # 売上計算
+                unit_price = self.item_props[item]['price']
+                # 今回は単純化のため、すべて定価で計算する仕様に戻しています
+                # (前回のロジックだと見切り品が売れる想定でしたが、ここはユーザー要望のコードベース)
+                self.daily_sales_amount += sell * unit_price
 
         transferred = self.run_transshipment(day)
 
@@ -413,6 +417,9 @@ class RealWorldSupplySimulation:
         
         self.daily_profit = self.daily_sales_amount - self.daily_procurement_cost - self.daily_disposal_cost - self.daily_transport_cost
         
+        # ★★★ 修正箇所: ここで累計売上を更新します ★★★
+        self.total_sales_amount += self.daily_sales_amount
+        
         return waste_count_today, self.daily_profit
 
 # ---------------------------------------------------------
@@ -421,7 +428,7 @@ class RealWorldSupplySimulation:
 def main():
     st.title("食品サプライチェーン経営シミュレーター")
     
-    # --- 解説パネルの追加 ---
+    # --- 解説パネル ---
     with st.expander("📖 シミュレーションの仕組みと戦略の解説"):
         st.markdown("""
         ### 1. 経済モデル：価格弾力性
@@ -531,7 +538,7 @@ def main():
             
             daily_waste = []
             cumulative_profit = []
-            daily_profits = [] # 追加: 日次利益の保存用
+            daily_profits = []
             current_cum_profit = 0
             
             for d in range(1, days + 1):
@@ -564,7 +571,7 @@ def main():
         progress.empty()
         
         # --- 結果表示 (Summary Table) ---
-        st.subheader(" 戦略別 損益・KPI比較")
+        st.subheader("📊 戦略別 損益・KPI比較")
         
         summary_data = []
         for s in strategies:
@@ -581,13 +588,13 @@ def main():
         
         # --- 比較モデル詳細検討 (Advanced Analysis) ---
         st.markdown("---")
-        st.subheader(" 比較モデルの検討（詳細分析）")
+        st.subheader("🔍 比較モデルの検討（詳細分析）")
         
         col_analysis_1, col_analysis_2 = st.columns(2)
         
         # 1. コスト構造分析 (Stacked Bar Chart)
         with col_analysis_1:
-            st.markdown("##### コスト構造の比較")
+            st.markdown("##### 💰 コスト構造の比較")
             st.caption("利益を生むためには、廃棄と輸送のバランスが重要です。")
             
             fig_cost, ax_cost = plt.subplots(figsize=(6, 4))
@@ -618,7 +625,7 @@ def main():
 
         # 2. 利益の安定性分析 (Box Plot)
         with col_analysis_2:
-            st.markdown("##### 利益の安定性 (リスク分析)")
+            st.markdown("##### 📉 利益の安定性 (リスク分析)")
             st.caption("日々の利益のばらつき（箱ひげ図）。箱が小さく高い位置にあるのが理想です。")
             
             fig_risk, ax_risk = plt.subplots(figsize=(6, 4))
@@ -635,7 +642,7 @@ def main():
 
         # --- 基本グラフ (Trend) ---
         st.markdown("---")
-        st.subheader("シミュレーション推移")
+        st.subheader("📈 シミュレーション推移")
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
         plt.subplots_adjust(hspace=0.3)
