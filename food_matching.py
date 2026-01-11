@@ -37,21 +37,18 @@ class RealWorldSupplySimulation:
                  demand_std_scale=1.0, 
                  transport_threshold=5,
                  transport_cost_unit=10,
-                 markdown_days=1,       # 追加: 値引き開始残日数
-                 markdown_rate=0.5):    # 追加: 値引き率 (0.0 ~ 1.0)
+                 markdown_days=1,       
+                 markdown_rate=0.5):    
         
         self.strategy = strategy
         self.rng = np.random.default_rng(random_seed)
         
-        # 値引き設定
         self.markdown_days = markdown_days
         self.markdown_rate = markdown_rate
         
-        # 1. 店舗情報
         self.shops = shop_config_df['店舗名'].tolist()
         self.shop_scales = dict(zip(shop_config_df['店舗名'], shop_config_df['規模倍率']))
 
-        # 2. 商品情報 (弾力性パラメータを追加)
         self.items = item_config_df['商品名'].tolist()
         self.item_props = {}
         for _, row in item_config_df.iterrows():
@@ -60,30 +57,26 @@ class RealWorldSupplySimulation:
                 'base_demand': int(row['基本需要(個)']),
                 'target_stock': int(row['発注基準(個)']),
                 'price': int(row['販売単価(円)']),
-                'base_price': int(row['基準価格(円)']),    # 基準価格
-                'elasticity': float(row['価格弾力性']),    # 価格弾力性
+                'base_price': int(row['基準価格(円)']),
+                'elasticity': float(row['価格弾力性']),
                 'cost': int(row['仕入れ原価(円)']),
                 'disposal': int(row['廃棄コスト(円)'])
             }
 
-        # 在庫データ
         self.current_stock = pd.DataFrame(columns=[
             'stock_id', 'retail_store', 'item', 'stock_quantity', 'remaining_shelf_life'
         ])
         self.next_stock_id = 1
         
-        # 累計KPI
         self.total_sales_amount = 0
         self.total_procurement_cost = 0
         self.total_disposal_cost = 0
         self.total_transport_cost = 0
         self.total_waste_count = 0
         
-        # サービスレベル計算用
         self.total_demand_qty = 0
         self.total_sold_qty = 0
         
-        # 日次計算用
         self.daily_procurement_cost = 0
         self.daily_sales_amount = 0
         self.daily_transport_cost = 0
@@ -93,19 +86,15 @@ class RealWorldSupplySimulation:
         self.WEEKLY_DEMAND_PATTERN = [1.0, 0.9, 0.9, 1.0, 1.2, 1.4, 1.3]
         self.demand_std_scale = demand_std_scale
         
-        # 転送パラメータ
         self.transport_threshold = transport_threshold
         self.transport_cost_unit = transport_cost_unit
 
-    # 基本需要の計算 (価格変動なしの状態)
     def get_base_expected_demand(self, shop, item, day):
         weekday = (day - 1) % 7
         factor = self.WEEKLY_DEMAND_PATTERN[weekday]
-        
         scale = self.shop_scales[shop]
         base_demand = self.item_props[item]['base_demand']
         
-        # 基準価格と定価の乖離による基本需要補正
         current_price = self.item_props[item]['price']
         base_price = self.item_props[item]['base_price']
         elasticity = self.item_props[item]['elasticity']
@@ -116,19 +105,14 @@ class RealWorldSupplySimulation:
         
         return base_demand * scale * factor * price_factor
 
-    # ---------------------------------------------------------
-    # 入荷プロセス (Inbound)
-    # ---------------------------------------------------------
     def inbound_process(self, day):
         if (day - 1) % 7 == 6: return 
 
         new_rows = []
         for shop in self.shops:
             for item in self.items:
-                # 発注判断のための基本需要（値引きなし前提）
                 base_forecast = self.get_base_expected_demand(shop, item, day)
                 
-                # 発注目標数
                 current_price = self.item_props[item]['price']
                 base_price = self.item_props[item]['base_price']
                 elasticity = self.item_props[item]['elasticity']
@@ -139,7 +123,6 @@ class RealWorldSupplySimulation:
                 scale = self.shop_scales[shop]
                 target_level = base_target * scale * price_factor
                 
-                # 発注点方式
                 current_stock_df = self.current_stock[
                     (self.current_stock['retail_store'] == shop) & 
                     (self.current_stock['item'] == item)
@@ -169,16 +152,12 @@ class RealWorldSupplySimulation:
         if new_rows:
             self.current_stock = pd.concat([self.current_stock, pd.DataFrame(new_rows)], ignore_index=True)
 
-    # ---------------------------------------------------------
-    # 転送プロセス (Transshipment)
-    # ---------------------------------------------------------
     def run_transshipment(self, day):
         if self.strategy == 'FIFO': return 0
         if self.strategy == 'LP': return self.run_lp_optimization(day)
         if self.strategy == 'New Optimization': return self.run_heuristic_optimization(day)
         return 0
 
-    # LP転送ロジック
     def run_lp_optimization(self, day):
         transferred_count = 0
         new_transferred_stock = []
@@ -194,7 +173,6 @@ class RealWorldSupplySimulation:
                     (self.current_stock['item'] == item)
                 ]
                 current_qty = stock_df['stock_quantity'].sum()
-                # 転送判断では通常需要を使用（値引きによるスパイクは考慮しないのが一般的）
                 next_demand = self.get_base_expected_demand(shop, item, day + 1)
                 
                 valid_stock = stock_df[stock_df['remaining_shelf_life'] >= 2]
@@ -212,7 +190,6 @@ class RealWorldSupplySimulation:
             x = LpVariable.dicts("route", (senders, receivers), 0, None, LpInteger)
             
             unit_price = self.item_props[item]['price']
-            # 利益最大化 (売上確保価値 - 輸送コスト)
             prob += lpSum([x[s][r] * (unit_price - self.transport_cost_unit) for s in senders for r in receivers])
             
             for s in senders:
@@ -260,7 +237,6 @@ class RealWorldSupplySimulation:
 
         return transferred_count
 
-    # New Model転送ロジック
     def run_heuristic_optimization(self, day):
         transferred_count = 0
         new_transferred_stock = []
@@ -355,29 +331,21 @@ class RealWorldSupplySimulation:
         sold_today = 0
         demand_rows = []
         
-        # --- 需要計算 (動的価格・マークダウン効果の反映) ---
         for shop in self.shops:
             for item in self.items:
-                # 1. まず通常の需要を計算
                 base_demand = self.get_base_expected_demand(shop, item, day)
                 
-                # 2. 値引き対象在庫があるか確認
                 stock_df = self.current_stock[
                     (self.current_stock['retail_store'] == shop) & 
                     (self.current_stock['item'] == item)
                 ]
                 
-                # 指定日数以下の在庫があれば「値引き販売」モード
                 has_markdown_stock = (stock_df['remaining_shelf_life'] <= self.markdown_days).any()
                 
-                # 値引き適用時の需要ブースト計算
-                # 割引価格 / 定価 = (1 - markdown_rate)
-                # 需要倍率 = (価格比率) ^ (-弾力性)
                 elasticity = self.item_props[item]['elasticity']
                 
                 if has_markdown_stock:
                     price_ratio = 1.0 - self.markdown_rate
-                    # 価格が下がると需要が増える (elasticity > 0)
                     demand_multiplier = price_ratio ** (-elasticity)
                 else:
                     demand_multiplier = 1.0
@@ -391,29 +359,19 @@ class RealWorldSupplySimulation:
         
         self.current_stock.reset_index(drop=True, inplace=True)
         
-        # --- 販売処理 (優先順位と動的売価) ---
         for d in demand_rows:
             shop, item, need = d['shop'], d['item'], d['qty']
             
-            # 在庫を取得
             stock_candidates = self.current_stock[
                 (self.current_stock['retail_store'] == shop) & 
                 (self.current_stock['item'] == item)
             ].copy()
             
-            # --- ★ 購入優先順位ロジック (Markdown優先 > FF) ---
-            # 優先度1: 値引き品 (remaining <= markdown_days) -> 最優先 (価格メリット)
-            # 優先度2: 通常品 -> 新しい順 (FF: Fresh First)
-            
             stock_candidates['is_normal'] = stock_candidates['remaining_shelf_life'] > self.markdown_days
             
-            # 分割してソート
-            # 値引き品 (古い順でも新しい順でも安ければ売れるが、店側は古い順に出したい。ここでは単純に期限昇順にしておく)
             discount_stock = stock_candidates[stock_candidates['is_normal'] == False].sort_values('remaining_shelf_life')
-            # 通常品 (FF: 新しい順)
             normal_stock = stock_candidates[stock_candidates['is_normal'] == True].sort_values('remaining_shelf_life', ascending=False)
             
-            # 結合
             targets = pd.concat([discount_stock, normal_stock])
             
             for idx, stock in targets.iterrows():
@@ -428,13 +386,10 @@ class RealWorldSupplySimulation:
                 self.total_sold_qty += sell
                 need -= sell
                 
-                # --- ★ 売上計算 (動的価格) ---
                 unit_price = self.item_props[item]['price']
                 if stock['remaining_shelf_life'] <= self.markdown_days:
-                    # 値引き価格
                     actual_price = int(unit_price * (1.0 - self.markdown_rate))
                 else:
-                    # 定価
                     actual_price = unit_price
                 
                 self.daily_sales_amount += sell * actual_price
@@ -463,7 +418,6 @@ class RealWorldSupplySimulation:
         
         self.daily_profit = self.daily_sales_amount - self.daily_procurement_cost - self.daily_disposal_cost - self.daily_transport_cost
         
-        # 累計売上の更新
         self.total_sales_amount += self.daily_sales_amount
         
         return waste_count_today, self.daily_profit
@@ -509,16 +463,17 @@ def main():
     with st.sidebar.expander("① 商品・店舗マスタ設定", expanded=True):
         st.caption("「基準価格」より高く売ると需要が減り、安く売ると増えます。")
         
+        # --- データセットの拡張 (商品: 3->5, 店舗: 4->6) ---
         default_items_data = {
-            '商品名': ['トマト', '牛乳', 'パン'],
-            '賞味期限(日)': [5, 7, 4],
-            '基本需要(個)': [8, 6, 8],
-            '発注基準(個)': [20, 15, 20],
-            '販売単価(円)': [120, 200, 150],
-            '基準価格(円)': [120, 200, 150],
-            '価格弾力性': [1.5, 0.8, 1.2],
-            '仕入れ原価(円)': [60, 140, 70],
-            '廃棄コスト(円)': [10, 20, 5]
+            '商品名': ['トマト', '牛乳', 'パン', 'ヨーグルト', '豆腐'],
+            '賞味期限(日)': [5, 7, 4, 14, 3],
+            '基本需要(個)': [8, 6, 8, 5, 10],
+            '発注基準(個)': [20, 15, 20, 12, 25],
+            '販売単価(円)': [120, 200, 150, 180, 80],
+            '基準価格(円)': [120, 200, 150, 180, 80],
+            '価格弾力性': [1.5, 0.8, 1.2, 1.0, 1.8],
+            '仕入れ原価(円)': [60, 140, 70, 100, 40],
+            '廃棄コスト(円)': [10, 20, 5, 10, 5]
         }
         df_items_default = pd.DataFrame(default_items_data)
         
@@ -536,8 +491,8 @@ def main():
         )
 
         default_shops_data = {
-            '店舗名': ['大学会館店', 'つくば駅前店', 'ひたち野牛久店', '研究学園店'],
-            '規模倍率': [1.5, 1.0, 0.6, 0.8]
+            '店舗名': ['大学会館店', 'つくば駅前店', 'ひたち野牛久店', '研究学園店', '並木店', '竹園店'],
+            '規模倍率': [1.5, 1.0, 0.6, 0.8, 0.9, 1.2]
         }
         df_shops_default = pd.DataFrame(default_shops_data)
         
@@ -554,7 +509,7 @@ def main():
         cost_unit = st.number_input("1個あたりの輸送コスト (円)", value=30)
         
         st.markdown("---")
-        st.markdown("##### 🏷️ 値引き(Markdown)設定")
+        st.markdown("##### 値引き(Markdown)設定") # 絵文字削除
         markdown_days = st.slider("値引き開始残日数", 1, 5, 1, help="賞味期限が残り何日になったら値引きするか")
         markdown_rate = st.slider("値引き率 (%)", 0, 90, 50, step=10, help="定価から何%引くか") / 100.0
         
@@ -599,7 +554,6 @@ def main():
             gross_profit = sim.total_sales_amount - sim.total_procurement_cost
             final_profit = gross_profit - sim.total_disposal_cost - sim.total_transport_cost
             
-            # サービス率の計算
             service_level = (sim.total_sold_qty / sim.total_demand_qty * 100) if sim.total_demand_qty > 0 else 0
             
             results[strat] = {
@@ -619,7 +573,7 @@ def main():
         progress.empty()
         
         # --- 結果表示 (Summary Table) ---
-        st.subheader("📊 戦略別 損益・KPI比較")
+        st.subheader("戦略別 損益・KPI比較") # 絵文字削除
         
         summary_data = []
         for s in strategies:
@@ -636,13 +590,13 @@ def main():
         
         # --- 比較モデル詳細検討 (Advanced Analysis) ---
         st.markdown("---")
-        st.subheader("🔍 比較モデルの検討（詳細分析）")
+        st.subheader("比較モデルの検討（詳細分析）") # 絵文字削除
         
         col_analysis_1, col_analysis_2 = st.columns(2)
         
         # 1. コスト構造分析 (Stacked Bar Chart)
         with col_analysis_1:
-            st.markdown("##### 💰 コスト構造の比較")
+            st.markdown("##### コスト構造の比較") # 絵文字削除
             st.caption("利益を生むためには、廃棄と輸送のバランスが重要です。")
             
             fig_cost, ax_cost = plt.subplots(figsize=(6, 4))
@@ -655,7 +609,6 @@ def main():
             transports = [results[s]['TransportCost'] for s in strategies]
             profits = [results[s]['Profit'] for s in strategies]
             
-            # 負の利益対応: 利益がマイナスの場合は0として積み上げ、別途表示等を検討（ここでは簡易表示）
             pos_profits = [max(0, p) for p in profits]
 
             p1 = ax_cost.bar(x_pos, procurements, bar_width, label='仕入', color='#a6cee3')
@@ -673,7 +626,7 @@ def main():
 
         # 2. 利益の安定性分析 (Box Plot)
         with col_analysis_2:
-            st.markdown("##### 📉 利益の安定性 (リスク分析)")
+            st.markdown("##### 利益の安定性 (リスク分析)") # 絵文字削除
             st.caption("日々の利益のばらつき（箱ひげ図）。箱が小さく高い位置にあるのが理想です。")
             
             fig_risk, ax_risk = plt.subplots(figsize=(6, 4))
@@ -690,7 +643,7 @@ def main():
 
         # --- 基本グラフ (Trend) ---
         st.markdown("---")
-        st.subheader("📈 シミュレーション推移")
+        st.subheader("シミュレーション推移") # 絵文字削除
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
         plt.subplots_adjust(hspace=0.3)
@@ -720,7 +673,7 @@ def main():
         best_strat = max(results, key=lambda x: results[x]['Profit'])
         worst_strat = min(results, key=lambda x: results[x]['Profit'])
         st.info(f"""
-        **💡 分析結果サマリー:**
+        **分析結果サマリー:**
         最も優れた成果を出したのは **{best_strat}** です。
         
         * **利益最大:** {best_strat} (¥{int(results[best_strat]['Profit']):,})
