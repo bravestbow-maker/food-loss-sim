@@ -26,7 +26,7 @@ setup_japanese_font()
 st.set_page_config(layout="wide", page_title="食品サプライチェーン経営シミュレーター")
 
 # ---------------------------------------------------------
-# 3. シミュレーションモデル (価格弾力性 対応版)
+# 3. シミュレーションモデル (動的価格・弾力性 対応版)
 # ---------------------------------------------------------
 class RealWorldSupplySimulation:
     def __init__(self, 
@@ -36,10 +36,16 @@ class RealWorldSupplySimulation:
                  random_seed=42, 
                  demand_std_scale=1.0, 
                  transport_threshold=5,
-                 transport_cost_unit=10):
+                 transport_cost_unit=10,
+                 markdown_days=1,       # 追加: 値引き開始残日数
+                 markdown_rate=0.5):    # 追加: 値引き率 (0.0 ~ 1.0)
         
         self.strategy = strategy
         self.rng = np.random.default_rng(random_seed)
+        
+        # 値引き設定
+        self.markdown_days = markdown_days
+        self.markdown_rate = markdown_rate
         
         # 1. 店舗情報
         self.shops = shop_config_df['店舗名'].tolist()
@@ -82,7 +88,7 @@ class RealWorldSupplySimulation:
         self.daily_sales_amount = 0
         self.daily_transport_cost = 0
         self.daily_disposal_cost = 0
-        self.daily_profit = 0  # 追加
+        self.daily_profit = 0
         
         self.WEEKLY_DEMAND_PATTERN = [1.0, 0.9, 0.9, 1.0, 1.2, 1.4, 1.3]
         self.demand_std_scale = demand_std_scale
@@ -91,22 +97,20 @@ class RealWorldSupplySimulation:
         self.transport_threshold = transport_threshold
         self.transport_cost_unit = transport_cost_unit
 
-    # 価格弾力性を考慮した需要計算
-    def get_expected_demand(self, shop, item, day):
+    # 基本需要の計算 (価格変動なしの状態)
+    def get_base_expected_demand(self, shop, item, day):
         weekday = (day - 1) % 7
         factor = self.WEEKLY_DEMAND_PATTERN[weekday]
         
-        # 1. 店舗規模 × 商品基本需要
         scale = self.shop_scales[shop]
         base_demand = self.item_props[item]['base_demand']
         
-        # 2. 価格弾力性による補正
+        # 基準価格と定価の乖離による基本需要補正
         current_price = self.item_props[item]['price']
         base_price = self.item_props[item]['base_price']
         elasticity = self.item_props[item]['elasticity']
         
         if base_price <= 0: base_price = 1
-        
         price_ratio = current_price / base_price
         price_factor = price_ratio ** (-elasticity)
         
@@ -121,20 +125,21 @@ class RealWorldSupplySimulation:
         new_rows = []
         for shop in self.shops:
             for item in self.items:
-                # 需要予測に基づく発注量の調整
+                # 発注判断のための基本需要（値引きなし前提）
+                base_forecast = self.get_base_expected_demand(shop, item, day)
+                
+                # 発注目標数
                 current_price = self.item_props[item]['price']
                 base_price = self.item_props[item]['base_price']
                 elasticity = self.item_props[item]['elasticity']
-                if base_price <= 0: base_price = 1
                 price_ratio = current_price / base_price
                 price_factor = price_ratio ** (-elasticity)
 
                 base_target = self.item_props[item]['target_stock']
                 scale = self.shop_scales[shop]
-                
                 target_level = base_target * scale * price_factor
                 
-                # 発注点方式 (Randomを削除し統一)
+                # 発注点方式
                 current_stock_df = self.current_stock[
                     (self.current_stock['retail_store'] == shop) & 
                     (self.current_stock['item'] == item)
@@ -168,7 +173,6 @@ class RealWorldSupplySimulation:
     # 転送プロセス (Transshipment)
     # ---------------------------------------------------------
     def run_transshipment(self, day):
-        # Random削除に伴い条件変更
         if self.strategy == 'FIFO': return 0
         if self.strategy == 'LP': return self.run_lp_optimization(day)
         if self.strategy == 'New Optimization': return self.run_heuristic_optimization(day)
@@ -190,7 +194,8 @@ class RealWorldSupplySimulation:
                     (self.current_stock['item'] == item)
                 ]
                 current_qty = stock_df['stock_quantity'].sum()
-                next_demand = self.get_expected_demand(shop, item, day + 1)
+                # 転送判断では通常需要を使用（値引きによるスパイクは考慮しないのが一般的）
+                next_demand = self.get_base_expected_demand(shop, item, day + 1)
                 
                 valid_stock = stock_df[stock_df['remaining_shelf_life'] >= 2]
                 valid_indices[shop] = valid_stock.index.tolist()
@@ -262,13 +267,12 @@ class RealWorldSupplySimulation:
         self.current_stock.reset_index(drop=True, inplace=True)
 
         for item in self.items:
-            # --- ★ コスト対効果の判定 ---
             unit_price = self.item_props[item]['price']
             disposal_cost = self.item_props[item]['disposal']
             economic_value = unit_price + disposal_cost
             
             if self.transport_cost_unit > economic_value:
-                continue # 輸送費が高すぎて割に合わないためスキップ
+                continue 
 
             senders = []
             receivers = []
@@ -279,7 +283,7 @@ class RealWorldSupplySimulation:
                     (self.current_stock['item'] == item)
                 ]
                 current_qty = stock_df['stock_quantity'].sum()
-                next_demand = self.get_expected_demand(shop, item, day + 1)
+                next_demand = self.get_base_expected_demand(shop, item, day + 1)
                 
                 safety_stock = next_demand * 0.2 
                 balance = current_qty - (next_demand + safety_stock)
@@ -302,7 +306,6 @@ class RealWorldSupplySimulation:
             for receiver in receivers:
                 for sender in senders:
                     if sender['qty'] <= 0 or receiver['qty'] <= 0: continue
-                    
                     amount = min(sender['qty'], receiver['qty'])
                     if amount < self.transport_threshold: continue
                     
@@ -351,27 +354,67 @@ class RealWorldSupplySimulation:
         
         sold_today = 0
         demand_rows = []
+        
+        # --- 需要計算 (動的価格・マークダウン効果の反映) ---
         for shop in self.shops:
             for item in self.items:
-                expected = self.get_expected_demand(shop, item, day)
+                # 1. まず通常の需要を計算
+                base_demand = self.get_base_expected_demand(shop, item, day)
+                
+                # 2. 値引き対象在庫があるか確認
+                stock_df = self.current_stock[
+                    (self.current_stock['retail_store'] == shop) & 
+                    (self.current_stock['item'] == item)
+                ]
+                
+                # 指定日数以下の在庫があれば「値引き販売」モード
+                has_markdown_stock = (stock_df['remaining_shelf_life'] <= self.markdown_days).any()
+                
+                # 値引き適用時の需要ブースト計算
+                # 割引価格 / 定価 = (1 - markdown_rate)
+                # 需要倍率 = (価格比率) ^ (-弾力性)
+                elasticity = self.item_props[item]['elasticity']
+                
+                if has_markdown_stock:
+                    price_ratio = 1.0 - self.markdown_rate
+                    # 価格が下がると需要が増える (elasticity > 0)
+                    demand_multiplier = price_ratio ** (-elasticity)
+                else:
+                    demand_multiplier = 1.0
+                
+                expected = base_demand * demand_multiplier
                 qty = max(0, int(self.rng.normal(expected, 4 * self.demand_std_scale)))
+                
                 if qty > 0:
                     demand_rows.append({'shop': shop, 'item': item, 'qty': qty})
-                    # 総需要数のカウント
                     self.total_demand_qty += qty
         
         self.current_stock.reset_index(drop=True, inplace=True)
         
+        # --- 販売処理 (優先順位と動的売価) ---
         for d in demand_rows:
             shop, item, need = d['shop'], d['item'], d['qty']
             
-            # --- ★ FF (Fresh First) 実装部分 ---
-            # ascending=False に変更: 賞味期限が「長い（新しい）」順に並べ替え
-            # これにより、顧客は最も新鮮なものを優先して購入する挙動となる
-            targets = self.current_stock[
+            # 在庫を取得
+            stock_candidates = self.current_stock[
                 (self.current_stock['retail_store'] == shop) & 
                 (self.current_stock['item'] == item)
-            ].sort_values('remaining_shelf_life', ascending=False)
+            ].copy()
+            
+            # --- ★ 購入優先順位ロジック (Markdown優先 > FF) ---
+            # 優先度1: 値引き品 (remaining <= markdown_days) -> 最優先 (価格メリット)
+            # 優先度2: 通常品 -> 新しい順 (FF: Fresh First)
+            
+            stock_candidates['is_normal'] = stock_candidates['remaining_shelf_life'] > self.markdown_days
+            
+            # 分割してソート
+            # 値引き品 (古い順でも新しい順でも安ければ売れるが、店側は古い順に出したい。ここでは単純に期限昇順にしておく)
+            discount_stock = stock_candidates[stock_candidates['is_normal'] == False].sort_values('remaining_shelf_life')
+            # 通常品 (FF: 新しい順)
+            normal_stock = stock_candidates[stock_candidates['is_normal'] == True].sort_values('remaining_shelf_life', ascending=False)
+            
+            # 結合
+            targets = pd.concat([discount_stock, normal_stock])
             
             for idx, stock in targets.iterrows():
                 if need <= 0: break
@@ -382,16 +425,19 @@ class RealWorldSupplySimulation:
                 sell = min(need, have)
                 self.current_stock.at[idx, 'stock_quantity'] -= sell
                 sold_today += sell
-                # 総販売数のカウント
                 self.total_sold_qty += sell
-                
                 need -= sell
                 
-                # 売上計算
+                # --- ★ 売上計算 (動的価格) ---
                 unit_price = self.item_props[item]['price']
-                # 今回は単純化のため、すべて定価で計算する仕様に戻しています
-                # (前回のロジックだと見切り品が売れる想定でしたが、ここはユーザー要望のコードベース)
-                self.daily_sales_amount += sell * unit_price
+                if stock['remaining_shelf_life'] <= self.markdown_days:
+                    # 値引き価格
+                    actual_price = int(unit_price * (1.0 - self.markdown_rate))
+                else:
+                    # 定価
+                    actual_price = unit_price
+                
+                self.daily_sales_amount += sell * actual_price
 
         transferred = self.run_transshipment(day)
 
@@ -417,7 +463,7 @@ class RealWorldSupplySimulation:
         
         self.daily_profit = self.daily_sales_amount - self.daily_procurement_cost - self.daily_disposal_cost - self.daily_transport_cost
         
-        # ★★★ 修正箇所: ここで累計売上を更新します ★★★
+        # 累計売上の更新
         self.total_sales_amount += self.daily_sales_amount
         
         return waste_count_today, self.daily_profit
@@ -431,33 +477,27 @@ def main():
     # --- 解説パネル ---
     with st.expander("📖 シミュレーションの仕組みと戦略の解説"):
         st.markdown("""
-        ### 1. 経済モデル：価格弾力性
-        商品は価格によって需要が変動します。「基準価格」より高く売ると需要は減少し、安く売ると増加します。
+        ### 1. 経済モデル：動的価格と弾力性
+        このモデルでは**「値引き販売（Markdown）」**をシミュレートします。
         
-        **需要計算式:** $$需要 = 基本需要 \\times \\left( \\frac{販売単価}{基準価格} \\right)^{-\\text{価格弾力性}}$$
+        * **価格弾力性:** 商品価格が下がると、その分だけ需要（客数）が増加します。
+        * **購入優先度:** 顧客は基本的に「新しい商品」を好みます (Fresh First) が、値引きシールが貼られた商品がある場合は、**安さを優先して**そちらから購入します。
         
         ---
         ### 2. 戦略の違い
         このシミュレーションでは3つの在庫管理戦略を比較します。
         
         1.  **FIFO (先入先出・発注点方式)**
-            * 毎朝、減った在庫分をきっちり発注して補充します。
-            * 店舗間の在庫転送は行いません。
-            * **特徴:** 基本的な管理手法ですが、需要の急変動には弱く、店ごとの過不足を解消できません。
+            * 基本的な管理手法。店舗間の在庫転送は行いません。
+            * 売れ残りは値引きして売り切ろうとしますが、それでも残れば廃棄されます。
 
         2.  **LP (線形計画法・最適化)**
-            * 数理最適化ソルバー(`PuLP`)を使用します。
-            * 全店舗の在庫状況を見て、「利益が最大（輸送コストも考慮）」になるように最適な在庫転送ルートを計算します。
-            * **特徴:** 理論上の「最強の経営」ですが、計算コストがかかります。
+            * 全店舗の在庫状況を見て、利益最大化を目指して最適に転送します。
+            * 「値引きして安く売る」よりも「定価で売れる店へ転送する」方が利益が出る場合、転送を選択します。
 
         3.  **New Optimization (ヒューリスティック・独自戦略)**
-            * 「余っている店」から「足りない店」へ、ルールベースで融通（転送）します。
-            * **重要:** 「輸送コスト」が「商品の利益＋廃棄回避額」を上回る場合は、転送せずに廃棄を選択する賢いコスト判定を行います。
-            * **特徴:** 高速な計算で、LPに近い利益を出そうとする実用的な戦略です。
-            
-        **※顧客行動モデル:**
-        本シミュレーションでは**「FF (Fresh First)」**を採用しています。
-        顧客は**「賞味期限が新しいもの」**を優先して購入するため、棚には古い商品が残りやすく、廃棄リスクが高い過酷な環境設定となっています。
+            * ルールベースで「余っている店」から「足りない店」へ融通します。
+            * 輸送コストと廃棄コストのトレードオフを高速に計算します。
         """)
 
     st.markdown("""
@@ -512,6 +552,12 @@ def main():
         demand_std = st.slider("需要のばらつき倍率", 0.0, 2.0, 1.0)
         threshold = st.slider("転送閾値 (New Model用)", 1, 10, 5)
         cost_unit = st.number_input("1個あたりの輸送コスト (円)", value=30)
+        
+        st.markdown("---")
+        st.markdown("##### 🏷️ 値引き(Markdown)設定")
+        markdown_days = st.slider("値引き開始残日数", 1, 5, 1, help="賞味期限が残り何日になったら値引きするか")
+        markdown_rate = st.slider("値引き率 (%)", 0, 90, 50, step=10, help="定価から何%引くか") / 100.0
+        
         seed_val = st.number_input("乱数シード", value=42, step=1, help="同じ値にすると結果が再現されます")
 
     if st.sidebar.button("3戦略比較を実行", type="primary"):
@@ -533,7 +579,9 @@ def main():
                 random_seed=seed_val,
                 demand_std_scale=demand_std,
                 transport_threshold=threshold,
-                transport_cost_unit=cost_unit
+                transport_cost_unit=cost_unit,
+                markdown_days=markdown_days,
+                markdown_rate=markdown_rate
             )
             
             daily_waste = []
@@ -680,7 +728,7 @@ def main():
         * **廃棄削減:** {best_strat}の廃棄コストは {worst_strat} と比較して大幅に抑制されています。
         
         詳細分析の「コスト構造」を見ると、LPやNew Optimizationは「輸送コスト」をかけてでも「廃棄」を防ぐことで、結果的に利益を最大化していることが分かります。
-        また、本シミュレーションでは顧客が新しい商品を優先的に購入する**FF (Fresh First)** モデルを採用しているため、古い在庫が残りやすく、適切な在庫転送を行わないFIFO戦略では廃棄が増加する傾向にあります。
+        また、このシミュレーションでは**「値引き販売」**が考慮されており、{int(markdown_rate*100)}%OFFされた商品は、定価の商品よりも優先的に購入されるため、廃棄直前の在庫が掃けやすくなっています。
         """)
 
 if __name__ == "__main__":
