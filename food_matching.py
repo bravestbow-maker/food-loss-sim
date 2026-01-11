@@ -73,7 +73,7 @@ class RealWorldSupplySimulation:
         self.total_transport_cost = 0
         self.total_waste_count = 0
         
-        # ★追加: サービスレベル計算用
+        # サービスレベル計算用
         self.total_demand_qty = 0
         self.total_sold_qty = 0
         
@@ -134,17 +134,14 @@ class RealWorldSupplySimulation:
                 
                 target_level = base_target * scale * price_factor
                 
-                if self.strategy == 'Random':
-                    order_qty = int(self.rng.uniform(target_level * 0.5, target_level * 1.5))
-                else:
-                    # 発注点方式
-                    current_stock_df = self.current_stock[
-                        (self.current_stock['retail_store'] == shop) & 
-                        (self.current_stock['item'] == item)
-                    ]
-                    current_qty = current_stock_df['stock_quantity'].sum()
-                    needed_qty = target_level - current_qty
-                    order_qty = max(0, int(self.rng.normal(needed_qty, target_level * 0.05)))
+                # 発注点方式 (Randomを削除し統一)
+                current_stock_df = self.current_stock[
+                    (self.current_stock['retail_store'] == shop) & 
+                    (self.current_stock['item'] == item)
+                ]
+                current_qty = current_stock_df['stock_quantity'].sum()
+                needed_qty = target_level - current_qty
+                order_qty = max(0, int(self.rng.normal(needed_qty, target_level * 0.05)))
                 
                 if order_qty > 0:
                     props = self.item_props[item]
@@ -171,7 +168,8 @@ class RealWorldSupplySimulation:
     # 転送プロセス (Transshipment)
     # ---------------------------------------------------------
     def run_transshipment(self, day):
-        if self.strategy in ['Random', 'FIFO']: return 0
+        # Random削除に伴い条件変更
+        if self.strategy == 'FIFO': return 0
         if self.strategy == 'LP': return self.run_lp_optimization(day)
         if self.strategy == 'New Optimization': return self.run_heuristic_optimization(day)
         return 0
@@ -359,17 +357,21 @@ class RealWorldSupplySimulation:
                 qty = max(0, int(self.rng.normal(expected, 4 * self.demand_std_scale)))
                 if qty > 0:
                     demand_rows.append({'shop': shop, 'item': item, 'qty': qty})
-                    # ★追加: 総需要数のカウント
+                    # 総需要数のカウント
                     self.total_demand_qty += qty
         
         self.current_stock.reset_index(drop=True, inplace=True)
         
         for d in demand_rows:
             shop, item, need = d['shop'], d['item'], d['qty']
+            
+            # --- ★ FF (Fresh First) 実装部分 ---
+            # ascending=False に変更: 賞味期限が「長い（新しい）」順に並べ替え
+            # これにより、顧客は最も新鮮なものを優先して購入する挙動となる
             targets = self.current_stock[
                 (self.current_stock['retail_store'] == shop) & 
                 (self.current_stock['item'] == item)
-            ].sort_values('remaining_shelf_life')
+            ].sort_values('remaining_shelf_life', ascending=False)
             
             for idx, stock in targets.iterrows():
                 if need <= 0: break
@@ -380,7 +382,7 @@ class RealWorldSupplySimulation:
                 sell = min(need, have)
                 self.current_stock.at[idx, 'stock_quantity'] -= sell
                 sold_today += sell
-                # ★追加: 総販売数のカウント
+                # 総販売数のカウント
                 self.total_sold_qty += sell
                 
                 need -= sell
@@ -429,31 +431,30 @@ def main():
         
         ---
         ### 2. 戦略の違い
-        このシミュレーションでは4つの在庫管理戦略を比較します。
+        このシミュレーションでは3つの在庫管理戦略を比較します。
         
-        1.  **Random (ランダム発注)**
-            * 発注量が適当（基準値の±50%）です。
-            * 店舗間の在庫転送は行いません。
-            * **特徴:** 欠品と廃棄が同時に大量発生する「悪い経営」の例です。
-
-        2.  **FIFO (先入先出・発注点方式)**
+        1.  **FIFO (先入先出・発注点方式)**
             * 毎朝、減った在庫分をきっちり発注して補充します。
             * 店舗間の在庫転送は行いません。
             * **特徴:** 基本的な管理手法ですが、需要の急変動には弱く、店ごとの過不足を解消できません。
 
-        3.  **LP (線形計画法・最適化)**
+        2.  **LP (線形計画法・最適化)**
             * 数理最適化ソルバー(`PuLP`)を使用します。
             * 全店舗の在庫状況を見て、「利益が最大（輸送コストも考慮）」になるように最適な在庫転送ルートを計算します。
             * **特徴:** 理論上の「最強の経営」ですが、計算コストがかかります。
 
-        4.  **New Optimization (ヒューリスティック・独自戦略)**
+        3.  **New Optimization (ヒューリスティック・独自戦略)**
             * 「余っている店」から「足りない店」へ、ルールベースで融通（転送）します。
             * **重要:** 「輸送コスト」が「商品の利益＋廃棄回避額」を上回る場合は、転送せずに廃棄を選択する賢いコスト判定を行います。
             * **特徴:** 高速な計算で、LPに近い利益を出そうとする実用的な戦略です。
+            
+        **※顧客行動モデル:**
+        本シミュレーションでは**「FF (Fresh First)」**を採用しています。
+        顧客は**「賞味期限が新しいもの」**を優先して購入するため、棚には古い商品が残りやすく、廃棄リスクが高い過酷な環境設定となっています。
         """)
 
     st.markdown("""
-    左側のサイドバーでパラメータを調整し、「4戦略比較を実行」ボタンを押してください。
+    左側のサイドバーでパラメータを調整し、「3戦略比較を実行」ボタンを押してください。
     """)
 
     st.sidebar.header("経営パラメータ設定")
@@ -506,13 +507,13 @@ def main():
         cost_unit = st.number_input("1個あたりの輸送コスト (円)", value=30)
         seed_val = st.number_input("乱数シード", value=42, step=1, help="同じ値にすると結果が再現されます")
 
-    if st.sidebar.button("4戦略比較を実行", type="primary"):
+    if st.sidebar.button("3戦略比較を実行", type="primary"):
         if edited_shops_df.empty or edited_items_df.empty:
             st.error("設定が必要です。")
             return
 
-        strategies = ['Random', 'FIFO', 'LP', 'New Optimization']
-        colors = {'Random': 'gray', 'FIFO': 'blue', 'LP': 'orange', 'New Optimization': 'red'}
+        strategies = ['FIFO', 'LP', 'New Optimization']
+        colors = {'FIFO': 'blue', 'LP': 'orange', 'New Optimization': 'red'}
         
         results = {}
         progress = st.progress(0)
@@ -640,7 +641,7 @@ def main():
         plt.subplots_adjust(hspace=0.3)
 
         for s in strategies:
-            alpha = 0.5 if s == 'Random' else 1.0
+            alpha = 1.0
             width = 2.5 if s == 'New Optimization' else 1.5
             ax1.plot(results[s]["CumProfit"], label=s, color=colors[s], alpha=alpha, linewidth=width)
             ax2.plot(results[s]["DailyWaste"], label=s, color=colors[s], alpha=alpha, linewidth=width)
@@ -672,6 +673,7 @@ def main():
         * **廃棄削減:** {best_strat}の廃棄コストは {worst_strat} と比較して大幅に抑制されています。
         
         詳細分析の「コスト構造」を見ると、LPやNew Optimizationは「輸送コスト」をかけてでも「廃棄」を防ぐことで、結果的に利益を最大化していることが分かります。
+        また、本シミュレーションでは顧客が新しい商品を優先的に購入する**FF (Fresh First)** モデルを採用しているため、古い在庫が残りやすく、適切な在庫転送を行わないFIFO戦略では廃棄が増加する傾向にあります。
         """)
 
 if __name__ == "__main__":
