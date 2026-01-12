@@ -206,7 +206,7 @@ class RealWorldSupplySimulation:
                         amount = int(amount)
                         transferred_count += amount
                         
-                        t_cost = amount * self.transport_cost_unit
+                        t_cost = int(amount * self.transport_cost_unit)
                         self.daily_transport_cost += t_cost
                         self.total_transport_cost += t_cost
                         
@@ -261,7 +261,6 @@ class RealWorldSupplySimulation:
                 current_qty = stock_df['stock_quantity'].sum()
                 next_demand = self.get_base_expected_demand(shop, item, day + 1)
                 
-                # ★修正: 安全在庫を整数(int)にキャストして端数を防ぐ
                 safety_stock = int(next_demand * 0.2)
                 balance = current_qty - (next_demand + safety_stock)
                 
@@ -286,14 +285,13 @@ class RealWorldSupplySimulation:
                     amount = min(sender['qty'], receiver['qty'])
                     if amount < self.transport_threshold: continue
                     
-                    # 念のためここでもint化
                     amount = int(amount)
                     
                     transferred_count += amount
                     sender['qty'] -= amount
                     receiver['qty'] -= amount
                     
-                    t_cost = amount * self.transport_cost_unit
+                    t_cost = int(amount * self.transport_cost_unit)
                     self.daily_transport_cost += t_cost
                     self.total_transport_cost += t_cost
                     
