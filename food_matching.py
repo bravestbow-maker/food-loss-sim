@@ -261,7 +261,8 @@ class RealWorldSupplySimulation:
                 current_qty = stock_df['stock_quantity'].sum()
                 next_demand = self.get_base_expected_demand(shop, item, day + 1)
                 
-                safety_stock = next_demand * 0.2 
+                # ★修正: 安全在庫を整数(int)にキャストして端数を防ぐ
+                safety_stock = int(next_demand * 0.2)
                 balance = current_qty - (next_demand + safety_stock)
                 
                 if balance > 0:
@@ -284,6 +285,9 @@ class RealWorldSupplySimulation:
                     if sender['qty'] <= 0 or receiver['qty'] <= 0: continue
                     amount = min(sender['qty'], receiver['qty'])
                     if amount < self.transport_threshold: continue
+                    
+                    # 念のためここでもint化
+                    amount = int(amount)
                     
                     transferred_count += amount
                     sender['qty'] -= amount
@@ -428,7 +432,6 @@ class RealWorldSupplySimulation:
 def main():
     st.title("食品サプライチェーン経営シミュレーター")
     
-    # --- 解説パネル ---
     with st.expander("📖 シミュレーションの仕組みと戦略の解説"):
         st.markdown("""
         ### 1. 経済モデル：動的価格と弾力性
@@ -463,7 +466,6 @@ def main():
     with st.sidebar.expander("① 商品・店舗マスタ設定", expanded=True):
         st.caption("「基準価格」より高く売ると需要が減り、安く売ると増えます。")
         
-        # --- データセットの拡張 (商品: 3->5, 店舗: 4->6) ---
         default_items_data = {
             '商品名': ['トマト', '牛乳', 'パン', 'ヨーグルト', '豆腐'],
             '賞味期限(日)': [5, 7, 4, 14, 3],
@@ -509,7 +511,7 @@ def main():
         cost_unit = st.number_input("1個あたりの輸送コスト (円)", value=30)
         
         st.markdown("---")
-        st.markdown("##### 値引き(Markdown)設定") # 絵文字削除
+        st.markdown("##### 値引き(Markdown)設定")
         markdown_days = st.slider("値引き開始残日数", 1, 5, 1, help="賞味期限が残り何日になったら値引きするか")
         markdown_rate = st.slider("値引き率 (%)", 0, 90, 50, step=10, help="定価から何%引くか") / 100.0
         
@@ -573,37 +575,37 @@ def main():
         progress.empty()
         
         # --- 結果表示 (Summary Table) ---
-        st.subheader("戦略別 損益・KPI比較") # 絵文字削除
+        st.subheader("戦略別 損益・KPI比較")
         
         summary_data = []
         for s in strategies:
             r = results[s]
+            # ★修正: 全てintキャストして端数表示を消す
             summary_data.append({
                 "戦略": s,
                 "最終利益": f"¥{int(r['Profit']):,}",
                 "サービス率": f"{r['ServiceLevel']:.1f}%",
-                "売上高": f"¥{r['Sales']:,}",
-                "廃棄コスト": f"¥{r['WasteCost']:,}",
-                "輸送コスト": f"¥{r['TransportCost']:,}"
+                "売上高": f"¥{int(r['Sales']):,}",
+                "廃棄コスト": f"¥{int(r['WasteCost']):,}",
+                "輸送コスト": f"¥{int(r['TransportCost']):,}"
             })
         st.table(pd.DataFrame(summary_data))
         
         # --- 比較モデル詳細検討 (Advanced Analysis) ---
         st.markdown("---")
-        st.subheader("比較モデルの検討（詳細分析）") # 絵文字削除
+        st.subheader("比較モデルの検討（詳細分析）")
         
         col_analysis_1, col_analysis_2 = st.columns(2)
         
         # 1. コスト構造分析 (Stacked Bar Chart)
         with col_analysis_1:
-            st.markdown("##### コスト構造の比較") # 絵文字削除
+            st.markdown("##### コスト構造の比較")
             st.caption("利益を生むためには、廃棄と輸送のバランスが重要です。")
             
             fig_cost, ax_cost = plt.subplots(figsize=(6, 4))
             bar_width = 0.6
             x_pos = np.arange(len(strategies))
             
-            # データの準備
             procurements = [results[s]['ProcurementCost'] for s in strategies]
             wastes = [results[s]['WasteCost'] for s in strategies]
             transports = [results[s]['TransportCost'] for s in strategies]
@@ -626,7 +628,7 @@ def main():
 
         # 2. 利益の安定性分析 (Box Plot)
         with col_analysis_2:
-            st.markdown("##### 利益の安定性 (リスク分析)") # 絵文字削除
+            st.markdown("##### 利益の安定性 (リスク分析)")
             st.caption("日々の利益のばらつき（箱ひげ図）。箱が小さく高い位置にあるのが理想です。")
             
             fig_risk, ax_risk = plt.subplots(figsize=(6, 4))
@@ -643,7 +645,7 @@ def main():
 
         # --- 基本グラフ (Trend) ---
         st.markdown("---")
-        st.subheader("シミュレーション推移") # 絵文字削除
+        st.subheader("シミュレーション推移")
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
         plt.subplots_adjust(hspace=0.3)
