@@ -5,13 +5,12 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import os
 import urllib.request
-from pulp import LpProblem, LpVariable, LpMaximize, lpSum, LpInteger, PULP_CBC_CMD
+from pulp import LpProblem, LpVariable, LpMinimize, LpMaximize, lpSum, LpInteger, PULP_CBC_CMD
 
 # ---------------------------------------------------------
-# 1. フォント設定 (日本語表示用)
+# 1. フォント設定
 # ---------------------------------------------------------
 def setup_japanese_font():
-    # Google Fontsから日本語フォントをダウンロードしてmatplotlibに設定する
     url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf"
     save_path = "NotoSansCJKjp-Regular.otf"
     if not os.path.exists(save_path):
@@ -27,7 +26,7 @@ setup_japanese_font()
 st.set_page_config(layout="wide", page_title="食品サプライチェーン経営シミュレーター")
 
 # ---------------------------------------------------------
-# 3. シミュレーションモデルクラス
+# 3. シミュレーションモデル (動的価格・弾力性 対応版)
 # ---------------------------------------------------------
 class RealWorldSupplySimulation:
     def __init__(self, 
@@ -44,7 +43,6 @@ class RealWorldSupplySimulation:
         self.strategy = strategy
         self.rng = np.random.default_rng(random_seed)
         
-        # --- 設定値の読み込み ---
         self.markdown_days = markdown_days
         self.markdown_rate = markdown_rate
         
@@ -65,47 +63,38 @@ class RealWorldSupplySimulation:
                 'disposal': int(row['廃棄コスト(円)'])
             }
 
-        # --- 在庫データフレームの初期化 ---
-        # 個々の在庫ロットを管理（どの店の、どの商品が、あと何日持つか）
         self.current_stock = pd.DataFrame(columns=[
             'stock_id', 'retail_store', 'item', 'stock_quantity', 'remaining_shelf_life'
         ])
         self.next_stock_id = 1
         
-        # --- 統計情報の初期化 ---
         self.total_sales_amount = 0
         self.total_procurement_cost = 0
         self.total_disposal_cost = 0
         self.total_transport_cost = 0
         self.total_waste_count = 0
+        
         self.total_demand_qty = 0
         self.total_sold_qty = 0
         
-        # 日次計算用変数
         self.daily_procurement_cost = 0
         self.daily_sales_amount = 0
         self.daily_transport_cost = 0
         self.daily_disposal_cost = 0
         self.daily_profit = 0
         
-        # 曜日変動係数（月曜〜日曜）
         self.WEEKLY_DEMAND_PATTERN = [1.0, 0.9, 0.9, 1.0, 1.2, 1.4, 1.3]
         self.demand_std_scale = demand_std_scale
         
         self.transport_threshold = transport_threshold
         self.transport_cost_unit = transport_cost_unit
 
-    # --- 需要予測の計算 ---
     def get_base_expected_demand(self, shop, item, day):
-        # 曜日による変動
         weekday = (day - 1) % 7
         factor = self.WEEKLY_DEMAND_PATTERN[weekday]
-        
-        # 店舗規模による変動
         scale = self.shop_scales[shop]
         base_demand = self.item_props[item]['base_demand']
         
-        # 価格弾力性による需要変動（定価より高いと売れにくい等）
         current_price = self.item_props[item]['price']
         base_price = self.item_props[item]['base_price']
         elasticity = self.item_props[item]['elasticity']
@@ -116,18 +105,14 @@ class RealWorldSupplySimulation:
         
         return base_demand * scale * factor * price_factor
 
-    # --- 商品入荷プロセス (朝の処理) ---
     def inbound_process(self, day):
-        # 日曜日は配送がないと仮定（または工場休業）
         if (day - 1) % 7 == 6: return 
 
         new_rows = []
         for shop in self.shops:
             for item in self.items:
-                # 明日の需要予測に基づいて発注数を決める
                 base_forecast = self.get_base_expected_demand(shop, item, day)
                 
-                # 価格要因を考慮した目標在庫レベル計算
                 current_price = self.item_props[item]['price']
                 base_price = self.item_props[item]['base_price']
                 elasticity = self.item_props[item]['elasticity']
@@ -138,20 +123,16 @@ class RealWorldSupplySimulation:
                 scale = self.shop_scales[shop]
                 target_level = base_target * scale * price_factor
                 
-                # 現在庫を確認して不足分を発注（(S, s)発注点方式に近い簡易版）
                 current_stock_df = self.current_stock[
                     (self.current_stock['retail_store'] == shop) & 
                     (self.current_stock['item'] == item)
                 ]
                 current_qty = current_stock_df['stock_quantity'].sum()
                 needed_qty = target_level - current_qty
-                
-                # 発注数には多少のばらつき（発注ミスや納品誤差）を持たせる
                 order_qty = max(0, int(self.rng.normal(needed_qty, target_level * 0.05)))
                 
                 if order_qty > 0:
                     props = self.item_props[item]
-                    # 輸送遅延シミュレーション（指数分布でたまに遅れる）
                     delay = int(self.rng.exponential(1.0))
                     life = max(1, props['life'] - delay)
                     
@@ -171,20 +152,12 @@ class RealWorldSupplySimulation:
         if new_rows:
             self.current_stock = pd.concat([self.current_stock, pd.DataFrame(new_rows)], ignore_index=True)
 
-    # --- 在庫転送の実行判定 (夕方の処理) ---
     def run_transshipment(self, day):
-        if self.strategy == 'FIFO':
-            # FIFO戦略は何もしない
-            return 0
-        if self.strategy == 'LP':
-            # 線形計画法による最適化
-            return self.run_lp_optimization(day)
-        if self.strategy == 'New Optimization':
-            # ヒューリスティック（独自ルール）による最適化
-            return self.run_heuristic_optimization(day)
+        if self.strategy == 'FIFO': return 0
+        if self.strategy == 'LP': return self.run_lp_optimization(day)
+        if self.strategy == 'New Optimization': return self.run_heuristic_optimization(day)
         return 0
 
-    # --- LP (線形計画法) 最適化ロジック ---
     def run_lp_optimization(self, day):
         transferred_count = 0
         new_transferred_stock = []
@@ -194,7 +167,6 @@ class RealWorldSupplySimulation:
             balances = {}
             valid_indices = {}
             
-            # 各店舗の「余剰」と「不足」を計算
             for shop in self.shops:
                 stock_df = self.current_stock[
                     (self.current_stock['retail_store'] == shop) & 
@@ -203,48 +175,33 @@ class RealWorldSupplySimulation:
                 current_qty = stock_df['stock_quantity'].sum()
                 next_demand = self.get_base_expected_demand(shop, item, day + 1)
                 
-                # 転送可能な在庫（賞味期限が2日以上あるものに限る）
                 valid_stock = stock_df[stock_df['remaining_shelf_life'] >= 2]
                 valid_indices[shop] = valid_stock.index.tolist()
                 
-                # 【改善点】LPでも安全在庫(需要の10%)を残すように設定し、過剰な転送による欠品を防ぐ
-                safety_stock = int(next_demand * 0.1)
-                balance = current_qty - (next_demand + safety_stock)
+                balance = current_qty - next_demand
                 balances[shop] = int(balance)
 
-            # 送り手（プラス）と受け手（マイナス）をリストアップ
             senders = [s for s, b in balances.items() if b > 0]
             receivers = [r for r, b in balances.items() if b < 0]
             
             if not senders or not receivers: continue
 
-            # 問題の定義（最大化問題）
             prob = LpProblem(f"Transshipment_{item}_{day}", LpMaximize)
             x = LpVariable.dicts("route", (senders, receivers), 0, None, LpInteger)
             
-            # 【重要】目的関数の設定
-            # 係数 = (販売単価 + 廃棄コスト回避分) - 輸送コスト
-            # ※「転送すれば廃棄せずに売れる」と仮定し、廃棄コスト分もメリットとして加算する
             unit_price = self.item_props[item]['price']
             disposal_cost = self.item_props[item]['disposal']
             
-            prob += lpSum([
-                x[s][r] * (unit_price + disposal_cost - self.transport_cost_unit) 
-                for s in senders for r in receivers
-            ])
+            # 目的関数: 転送による経済的価値の最大化 (売価 + 廃棄回避 - 輸送コスト)
+            prob += lpSum([x[s][r] * (unit_price + disposal_cost - self.transport_cost_unit) for s in senders for r in receivers])
             
-            # 制約条件
             for s in senders:
-                # 送り手は余剰分以上は送れない
                 prob += lpSum([x[s][r] for r in receivers]) <= balances[s]
             for r in receivers:
-                # 受け手は不足分以上は受け取らない（過剰在庫になるため）
                 prob += lpSum([x[s][r] for s in senders]) <= abs(balances[r])
 
-            # ソルバー実行（メッセージ非表示）
             prob.solve(PULP_CBC_CMD(msg=0))
             
-            # 結果の適用処理
             for s in senders:
                 for r in receivers:
                     amount = x[s][r].value()
@@ -252,12 +209,10 @@ class RealWorldSupplySimulation:
                         amount = int(amount)
                         transferred_count += amount
                         
-                        # 輸送コスト計上
                         t_cost = int(amount * self.transport_cost_unit)
                         self.daily_transport_cost += t_cost
                         self.total_transport_cost += t_cost
                         
-                        # 送り元の在庫を減らし、受け取り先の在庫を増やす処理
                         remaining = amount
                         for idx in valid_indices[s]:
                             if remaining <= 0: break
@@ -269,7 +224,6 @@ class RealWorldSupplySimulation:
                             self.current_stock.at[idx, 'stock_quantity'] -= take
                             remaining -= take
                             
-                            # 元の賞味期限を引き継いで新しい店へ移動
                             original_row = self.current_stock.loc[idx]
                             new_row = {
                                 'stock_id': self.next_stock_id,
@@ -286,7 +240,6 @@ class RealWorldSupplySimulation:
 
         return transferred_count
 
-    # --- ヒューリスティック (独自戦略) 最適化ロジック ---
     def run_heuristic_optimization(self, day):
         transferred_count = 0
         new_transferred_stock = []
@@ -295,10 +248,8 @@ class RealWorldSupplySimulation:
         for item in self.items:
             unit_price = self.item_props[item]['price']
             disposal_cost = self.item_props[item]['disposal']
-            
-            # 基本的な経済価値チェック
-            # 輸送コストが「売価＋廃棄コスト」より高ければ、絶対に元が取れないので何もしない
             economic_value = unit_price + disposal_cost
+            
             if self.transport_cost_unit > economic_value:
                 continue 
 
@@ -313,12 +264,10 @@ class RealWorldSupplySimulation:
                 current_qty = stock_df['stock_quantity'].sum()
                 next_demand = self.get_base_expected_demand(shop, item, day + 1)
                 
-                # 安全在庫の設定（需要の20%）
                 safety_stock = int(next_demand * 0.2)
                 balance = current_qty - (next_demand + safety_stock)
                 
                 if balance > 0:
-                    # 余剰がある場合
                     valid_stock = stock_df[stock_df['remaining_shelf_life'] >= 2]
                     sendable = valid_stock['stock_quantity'].sum()
                     surplus = max(0, sendable - (next_demand + safety_stock))
@@ -326,35 +275,17 @@ class RealWorldSupplySimulation:
                         senders.append({'shop': shop, 'qty': surplus, 'df_index': valid_stock.index.tolist()})
                         
                 elif current_qty < next_demand:
-                    # 不足している場合、「緊急度」を計算
                     shortage = next_demand - current_qty
-                    # 緊急度 = 不足数 / 需要（需要に対してどのくらい足りないかの割合）
                     urgency = shortage / (next_demand + 1)
                     receivers.append({'shop': shop, 'qty': shortage, 'urgency': urgency})
 
-            # 緊急度の高い順に受け手をソート
             receivers.sort(key=lambda x: x['urgency'], reverse=True)
-            # 量が多い順に送り手をソート
             senders.sort(key=lambda x: x['qty'], reverse=True)
             
-            # 貪欲法によるマッチング
             for receiver in receivers:
                 for sender in senders:
                     if sender['qty'] <= 0 or receiver['qty'] <= 0: continue
-                    
                     amount = min(sender['qty'], receiver['qty'])
-                    
-                    # 【改善点】転送による経済的メリットの厳密な判定
-                    # メリット: (売価 + 廃棄回避) * 個数
-                    benefit_total = amount * (unit_price + disposal_cost)
-                    # デメリット: 輸送コスト * 個数
-                    cost_total = amount * self.transport_cost_unit
-                    
-                    # コストがメリットを上回るなら転送しない
-                    if cost_total >= benefit_total:
-                        continue
-
-                    # ユーザー設定の最小転送数（閾値）未満なら転送しない
                     if amount < self.transport_threshold: continue
                     
                     amount = int(amount)
@@ -367,7 +298,6 @@ class RealWorldSupplySimulation:
                     self.daily_transport_cost += t_cost
                     self.total_transport_cost += t_cost
                     
-                    # 在庫移動処理（FIFOロジックで古い在庫から抜くわけではなく、データフレーム順に処理）
                     remaining = amount
                     for idx in sender['df_index']:
                         if remaining <= 0: break
@@ -395,18 +325,14 @@ class RealWorldSupplySimulation:
 
         return transferred_count
 
-    # --- 1日のシミュレーション実行 ---
     def step(self, day):
-        # 日次変数のリセット
         self.daily_procurement_cost = 0
         self.daily_sales_amount = 0
         self.daily_transport_cost = 0
         self.daily_disposal_cost = 0
         
-        # 1. 入荷 (Inbound)
         self.inbound_process(day)
         
-        # 2. 販売 (Sales)
         sold_today = 0
         demand_rows = []
         
@@ -419,18 +345,16 @@ class RealWorldSupplySimulation:
                     (self.current_stock['item'] == item)
                 ]
                 
-                # Markdown（値引き）対象の在庫があるかチェック
                 has_markdown_stock = (stock_df['remaining_shelf_life'] <= self.markdown_days).any()
+                
                 elasticity = self.item_props[item]['elasticity']
                 
-                # 値引き在庫がある場合は、安くなるので需要が増える
                 if has_markdown_stock:
                     price_ratio = 1.0 - self.markdown_rate
                     demand_multiplier = price_ratio ** (-elasticity)
                 else:
                     demand_multiplier = 1.0
                 
-                # 実際の需要発生（正規分布でばらつかせる）
                 expected = base_demand * demand_multiplier
                 qty = max(0, int(self.rng.normal(expected, 4 * self.demand_std_scale)))
                 
@@ -440,7 +364,6 @@ class RealWorldSupplySimulation:
         
         self.current_stock.reset_index(drop=True, inplace=True)
         
-        # 需要に対する引き当て処理
         for d in demand_rows:
             shop, item, need = d['shop'], d['item'], d['qty']
             
@@ -449,13 +372,9 @@ class RealWorldSupplySimulation:
                 (self.current_stock['item'] == item)
             ].copy()
             
-            # 消費者の購買行動モデル:
-            # 基本は「新しいもの」が好きだが、「値引き」があればそちらを優先する
             stock_candidates['is_normal'] = stock_candidates['remaining_shelf_life'] > self.markdown_days
             
-            # 値引き品（期限が近い）を優先
             discount_stock = stock_candidates[stock_candidates['is_normal'] == False].sort_values('remaining_shelf_life')
-            # 定価品（期限が遠い）は新しい順（Fresh First）
             normal_stock = stock_candidates[stock_candidates['is_normal'] == True].sort_values('remaining_shelf_life', ascending=False)
             
             targets = pd.concat([discount_stock, normal_stock])
@@ -472,7 +391,6 @@ class RealWorldSupplySimulation:
                 self.total_sold_qty += sell
                 need -= sell
                 
-                # 売上計算
                 unit_price = self.item_props[item]['price']
                 if stock['remaining_shelf_life'] <= self.markdown_days:
                     actual_price = int(unit_price * (1.0 - self.markdown_rate))
@@ -481,10 +399,8 @@ class RealWorldSupplySimulation:
                 
                 self.daily_sales_amount += sell * actual_price
 
-        # 3. 店舗間転送 (Transshipment) - 明日のための在庫調整
         transferred = self.run_transshipment(day)
 
-        # 4. 廃棄処理 (Disposal) - 賞味期限切れチェック
         expired = self.current_stock['remaining_shelf_life'] <= 0
         waste_count_today = 0
         
@@ -499,14 +415,12 @@ class RealWorldSupplySimulation:
         self.total_waste_count += waste_count_today
         self.total_disposal_cost += self.daily_disposal_cost
         
-        # 期限切れ在庫の削除と、残存日数の減算
         self.current_stock = self.current_stock[
             (self.current_stock['stock_quantity'] > 0) & 
             (self.current_stock['remaining_shelf_life'] > 0)
         ]
         self.current_stock['remaining_shelf_life'] -= 1
         
-        # 利益計算 (売上 - 仕入 - 廃棄 - 輸送)
         self.daily_profit = self.daily_sales_amount - self.daily_procurement_cost - self.daily_disposal_cost - self.daily_transport_cost
         
         self.total_sales_amount += self.daily_sales_amount
@@ -537,11 +451,11 @@ def main():
 
         2.  **LP (線形計画法・最適化)**
             * 全店舗の在庫状況を見て、利益最大化を目指して最適に転送します。
-            * 「値引きして売る」利益や「廃棄回避」による損失防止まで考慮し、輸送コストをかけてでも送るべきかを数学的に判断します。
+            * 「値引きして安く売る」よりも「定価で売れる店へ転送する」方が利益が出る場合、転送を選択します。
 
         3.  **New Optimization (ヒューリスティック・独自戦略)**
             * ルールベースで「余っている店」から「足りない店」へ融通します。
-            * 「緊急度（需要に対する不足割合）」を見て優先順位を決めつつ、輸送コスト倒れにならないよう経済合理性もチェックします。
+            * 輸送コストと廃棄コストのトレードオフを高速に計算します。
         """)
 
     st.markdown("""
@@ -640,7 +554,6 @@ def main():
                 current_cum_profit += p
                 cumulative_profit.append(current_cum_profit)
             
-            # 最終的なKPI計算
             gross_profit = sim.total_sales_amount - sim.total_procurement_cost
             final_profit = gross_profit - sim.total_disposal_cost - sim.total_transport_cost
             
@@ -758,7 +671,7 @@ def main():
 
         st.pyplot(fig)
         
-        # 結論
+        # 結論の動的生成
         best_strat = max(results, key=lambda x: results[x]['Profit'])
         worst_strat = min(results, key=lambda x: results[x]['Profit'])
         st.info(f"""
@@ -767,9 +680,10 @@ def main():
         
         * **利益最大:** {best_strat} (¥{int(results[best_strat]['Profit']):,})
         * **サービス率:** {results[best_strat]['ServiceLevel']:.1f}%
+        * **廃棄削減:** {best_strat}の廃棄コストは {worst_strat} と比較して大幅に抑制されています。
         
-        今回の修正により、LPモデルは「廃棄回避」のメリットを考慮するようになったため、以前よりも積極的に転送を行うようになり、廃棄ロスを最小限に抑えています。
-        また、New Optimization（ヒューリスティック）も単純な個数チェックだけでなく「経済価値」を判定に加えたため、無駄な転送による赤字を防ぎつつ、機会損失を防ぐ動きをしています。
+        詳細分析の「コスト構造」を見ると、LPやNew Optimizationは「輸送コスト」をかけてでも「廃棄」を防ぐことで、結果的に利益を最大化していることが分かります。
+        また、このシミュレーションでは**「値引き販売」**が考慮されており、{int(markdown_rate*100)}%OFFされた商品は、定価の商品よりも優先的に購入されるため、廃棄直前の在庫が掃けやすくなっています。
         """)
 
 if __name__ == "__main__":
