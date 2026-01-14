@@ -190,7 +190,14 @@ class RealWorldSupplySimulation:
             x = LpVariable.dicts("route", (senders, receivers), 0, None, LpInteger)
             
             unit_price = self.item_props[item]['price']
-            prob += lpSum([x[s][r] * (unit_price - self.transport_cost_unit) for s in senders for r in receivers])
+            disposal_cost = self.item_props[item]['disposal'] # 修正箇所：廃棄コストを取得
+            
+            # -------------------------------------------------------
+            # 【修正】目的関数を「経済的価値（p + d - c）」に変更
+            # 以前: unit_price - self.transport_cost_unit
+            # 修正: unit_price + disposal_cost - self.transport_cost_unit
+            # -------------------------------------------------------
+            prob += lpSum([x[s][r] * (unit_price + disposal_cost - self.transport_cost_unit) for s in senders for r in receivers])
             
             for s in senders:
                 prob += lpSum([x[s][r] for r in receivers]) <= balances[s]
