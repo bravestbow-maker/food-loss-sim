@@ -8,7 +8,7 @@ import urllib.request
 from pulp import LpProblem, LpVariable, LpMinimize, LpMaximize, lpSum, LpInteger, PULP_CBC_CMD
 
 # ---------------------------------------------------------
-# 1. フォント設定 (日本語表示用)
+# 1. フォント設定
 # ---------------------------------------------------------
 def setup_japanese_font():
     url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf"
@@ -26,7 +26,7 @@ setup_japanese_font()
 st.set_page_config(layout="wide", page_title="食品サプライチェーン経営シミュレーター")
 
 # ---------------------------------------------------------
-# 3. シミュレーションモデルクラス
+# 3. シミュレーションモデル
 # ---------------------------------------------------------
 class RealWorldSupplySimulation:
     def __init__(self, 
@@ -192,10 +192,6 @@ class RealWorldSupplySimulation:
             unit_price = self.item_props[item]['price']
             disposal_cost = self.item_props[item]['disposal']
             
-            # -------------------------------------------------------
-            # 【重要】LPの目的関数（修正済み）
-            # 経済的価値 = 売価(p) + 廃棄回避(d) - 輸送費(c)
-            # -------------------------------------------------------
             prob += lpSum([x[s][r] * (unit_price + disposal_cost - self.transport_cost_unit) for s in senders for r in receivers])
             
             for s in senders:
@@ -443,7 +439,7 @@ def run_monte_carlo(n_trials, strategies, shop_df, item_df, days, demand_std, th
     status_text = st.empty()
     
     for i in range(n_trials):
-        # 毎回異なるシード値を使用（試行ごとに結果をばらつかせるため）
+        # 毎回異なるシード値を使用
         current_seed = i * 100  
         
         status_text.text(f"試行 {i+1} / {n_trials} 実行中...")
@@ -456,7 +452,7 @@ def run_monte_carlo(n_trials, strategies, shop_df, item_df, days, demand_std, th
                 strategy=strat,
                 shop_config_df=shop_df,
                 item_config_df=item_df,
-                random_seed=current_seed, # シードを変える
+                random_seed=current_seed, 
                 demand_std_scale=demand_std,
                 transport_threshold=threshold,
                 transport_cost_unit=cost_unit,
@@ -538,7 +534,7 @@ def main():
     colors = {'FIFO': 'blue', 'LP': 'orange', 'New Optimization': 'red'}
 
     # ==========================================
-    # TAB 1: 単発実行モード (詳細グラフ)
+    # TAB 1: 単発実行モード (従来の詳細グラフ＆考察)
     # ==========================================
     with tab1:
         st.markdown("##### 特定の条件下での詳細な挙動を確認します。")
@@ -594,7 +590,8 @@ def main():
                 
                 progress.empty()
                 
-                # 結果表示
+                # --- 結果表示 (Summary Table) ---
+                st.subheader("戦略別 損益・KPI比較")
                 summary_data = []
                 for s in strategies:
                     r = results[s]
@@ -607,6 +604,10 @@ def main():
                         "輸送コスト": f"¥{int(r['TransportCost']):,}"
                     })
                 st.table(pd.DataFrame(summary_data))
+                
+                # --- グラフ表示 ---
+                st.markdown("---")
+                st.subheader("詳細分析")
                 
                 col_analysis_1, col_analysis_2 = st.columns(2)
                 
@@ -622,26 +623,49 @@ def main():
                     profits = [results[s]['Profit'] for s in strategies]
                     pos_profits = [max(0, p) for p in profits]
 
-                    p1 = ax_cost.bar(x_pos, procurements, bar_width, label='仕入', color='#a6cee3')
-                    p2 = ax_cost.bar(x_pos, wastes, bar_width, bottom=procurements, label='廃棄', color='#e31a1c')
-                    p3 = ax_cost.bar(x_pos, transports, bar_width, bottom=np.array(procurements)+np.array(wastes), label='輸送', color='#ff7f00')
-                    p4 = ax_cost.bar(x_pos, pos_profits, bar_width, bottom=np.array(procurements)+np.array(wastes)+np.array(transports), label='利益', color='#33a02c')
+                    ax_cost.bar(x_pos, procurements, bar_width, label='仕入', color='#a6cee3')
+                    ax_cost.bar(x_pos, wastes, bar_width, bottom=procurements, label='廃棄', color='#e31a1c')
+                    ax_cost.bar(x_pos, transports, bar_width, bottom=np.array(procurements)+np.array(wastes), label='輸送', color='#ff7f00')
+                    ax_cost.bar(x_pos, pos_profits, bar_width, bottom=np.array(procurements)+np.array(wastes)+np.array(transports), label='利益', color='#33a02c')
 
                     ax_cost.set_xticks(x_pos)
                     ax_cost.set_xticklabels(strategies, fontsize=9)
-                    ax_cost.set_ylabel("金額 (円)")
                     ax_cost.legend(loc='upper left', bbox_to_anchor=(1, 1), fontsize='small')
                     st.pyplot(fig_cost)
 
                 with col_analysis_2:
-                    st.markdown("##### 累積利益の推移")
-                    fig, ax1 = plt.subplots(figsize=(6, 4))
-                    for s in strategies:
-                        width = 2.5 if s == 'New Optimization' else 1.5
-                        ax1.plot(results[s]["CumProfit"], label=s, color=colors[s], linewidth=width)
-                    ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-                    ax1.legend()
-                    st.pyplot(fig)
+                    st.markdown("##### 利益の安定性 (リスク分析)")
+                    fig_risk, ax_risk = plt.subplots(figsize=(6, 4))
+                    data_to_plot = [results[s]['DailyProfits'] for s in strategies]
+                    ax_risk.boxplot(data_to_plot, labels=strategies, patch_artist=True,
+                                    boxprops=dict(facecolor="lightblue", color="blue"),
+                                    medianprops=dict(color="red"))
+                    ax_risk.set_ylabel("日次利益 (円)")
+                    st.pyplot(fig_risk)
+
+                st.markdown("##### 累積利益の推移")
+                fig, ax1 = plt.subplots(figsize=(10, 4))
+                for s in strategies:
+                    width = 2.5 if s == 'New Optimization' else 1.5
+                    ax1.plot(results[s]["CumProfit"], label=s, color=colors[s], linewidth=width)
+                ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+                ax1.legend()
+                st.pyplot(fig)
+                
+                # --- 考察文章の生成（復活！）---
+                best_strat = max(results, key=lambda x: results[x]['Profit'])
+                worst_strat = min(results, key=lambda x: results[x]['Profit'])
+                st.info(f"""
+                **分析結果サマリー:**
+                最も優れた成果を出したのは **{best_strat}** です。
+                
+                * **利益最大:** {best_strat} (¥{int(results[best_strat]['Profit']):,})
+                * **サービス率:** {results[best_strat]['ServiceLevel']:.1f}%
+                * **廃棄削減:** {best_strat}の廃棄コストは {worst_strat} と比較して大幅に抑制されています。
+                
+                詳細分析の「コスト構造」を見ると、LPやNew Optimizationは「輸送コスト」をかけてでも「廃棄」を防ぐことで、結果的に利益を最大化していることが分かります。
+                また、このシミュレーションでは**「値引き販売」**が考慮されており、{int(markdown_rate*100)}%OFFされた商品は、定価の商品よりも優先的に購入されるため、廃棄直前の在庫が掃けやすくなっています。
+                """)
 
     # ==========================================
     # TAB 2: 統計的検証モード (モンテカルロ)
